@@ -137,6 +137,28 @@ public:
     }
 };
 
+// Sample system memory usage % via /proc/meminfo. "Used" follows the same
+// definition `free(1)` does: 100 * (MemTotal - MemAvailable) / MemTotal,
+// which counts page cache as available rather than used.
+class MemMeter {
+public:
+    double sample() {
+        FILE* fp = std::fopen("/proc/meminfo", "r");
+        if (!fp) return 0.0;
+        uint64_t total = 0, avail = 0;
+        char key[32]; uint64_t val;
+        while (std::fscanf(fp, "%31s %lu kB\n", key, &val) == 2) {
+            if      (std::strcmp(key, "MemTotal:")     == 0) total = val;
+            else if (std::strcmp(key, "MemAvailable:") == 0) avail = val;
+            if (total && avail) break;
+        }
+        std::fclose(fp);
+        if (!total) return 0.0;
+        if (avail > total) avail = total;
+        return 100.0 * (double)(total - avail) / (double)total;
+    }
+};
+
 // dma_heap_allocation_data + DMA_HEAP_IOCTL_ALLOC ABI copy (the same constants
 // dma_heap.cpp uses internally). We only need them here to allocate the
 // worker's per-instance batch input dmabuf.
@@ -213,7 +235,9 @@ void print_usage(const char* prog) {
         "      --fullscreen         when --display 1, request a fullscreen window\n"
         "                           (waylandsink fullscreen=true). Otherwise the window\n"
         "                           is borderless via Weston's server-side decorations\n"
-        "                           and the user can drag-resize it freely.\n\n"
+        "                           and the user can drag-resize it freely.\n"
+        "      --no-annotate        skip per-stream postproc + box/label drawing. Streams\n"
+        "                           pass through clean; only the overall HUD remains.\n\n"
         "Diagnostic / advanced:\n"
         "  -b, --bench MODE         0=full pipeline (default)\n"
         "                           1=skip draw + write (postproc kept)\n"
@@ -253,10 +277,12 @@ int main(int argc, char** argv) {
     bool   unpaced         = false;
     bool   py_dispatch     = false;
     bool   fullscreen      = false;
+    bool   no_annotate     = false;
     std::string py_worker_path = "tools/aipu_worker.py";
 
     enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE,
-           OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER, OPT_FULLSCREEN };
+           OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER, OPT_FULLSCREEN,
+           OPT_NO_ANNOTATE };
     static const struct option long_opts[] = {
         {"model",    required_argument, nullptr, 'm'},
         {"inputs",   required_argument, nullptr, 'i'},
@@ -270,6 +296,7 @@ int main(int argc, char** argv) {
         {"py-dispatch", no_argument,       nullptr, OPT_PY_DISPATCH},
         {"py-worker",   required_argument, nullptr, OPT_PY_WORKER},
         {"fullscreen",  no_argument,       nullptr, OPT_FULLSCREEN},
+        {"no-annotate", no_argument,       nullptr, OPT_NO_ANNOTATE},
         {"display",     required_argument, nullptr, 'd'},
         {"bench",    required_argument, nullptr, 'b'},
         {"workers",  required_argument, nullptr, 'w'},
@@ -296,6 +323,7 @@ int main(int argc, char** argv) {
             case OPT_PY_DISPATCH: py_dispatch   = true;                 break;
             case OPT_PY_WORKER:  py_worker_path = optarg;               break;
             case OPT_FULLSCREEN: fullscreen     = true;                 break;
+            case OPT_NO_ANNOTATE: no_annotate   = true;                 break;
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
@@ -327,6 +355,7 @@ int main(int argc, char** argv) {
     // ---- TTF atlases ----
     FontAtlas* font14 = yvm::build_atlas(14.0f);
     FontAtlas* font18 = yvm::build_atlas(18.0f);
+    FontAtlas* font24 = yvm::build_atlas(24.0f);  // HUD text
 
     // ---- parse comma-separated input paths ----
     std::vector<std::unique_ptr<Stream>> streams;
@@ -720,7 +749,10 @@ int main(int argc, char** argv) {
                 s->pending.erase(it);
                 ++s->next_idx;
 
-                if (bench < 2) {
+                // With --no-annotate the per-stream postproc + box draw is skipped
+                // entirely. The streams pass through untouched and only the global
+                // HUD on the composite remains.
+                if (!no_annotate && bench < 2) {
                     std::vector<const int8_t*> ptrs(cur->outputs.size());
                     for (size_t k = 0; k < cur->outputs.size(); ++k) ptrs[k] = cur->outputs[k].data();
                     dets.clear();
@@ -824,12 +856,14 @@ int main(int argc, char** argv) {
             // Overall HUD state: sample once per second so the readout is steady
             // (we still redraw the last sampled values onto every composite frame).
             CpuMeter cpu;
+            MemMeter mem;
             auto hud_t_prev = clk2::now();
             int  hud_last_inf = frames_inferred.load(std::memory_order_relaxed);
             std::vector<int> hud_last_drawn(streams.size(), 0);
             for (size_t i = 0; i < streams.size(); ++i)
                 hud_last_drawn[i] = streams[i]->drawn.load(std::memory_order_relaxed);
-            double hud_e2e_fps = 0.0, hud_inf_fps = 0.0, hud_cpu_pct = 0.0;
+            double hud_e2e_fps = 0.0, hud_inf_fps = 0.0,
+                   hud_cpu_pct = 0.0, hud_mem_pct = 0.0;
 
             while (!disp_stop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_until(next);
@@ -871,20 +905,64 @@ int main(int argc, char** argv) {
                     }
                     hud_e2e_fps = agg;
                     hud_cpu_pct = cpu.sample();
+                    hud_mem_pct = mem.sample();
                     hud_t_prev  = now;
                 }
 
-                char hud[160];
-                std::snprintf(hud, sizeof hud,
-                              "E2E %.0f fps  |  Infer %.0f fps  |  CPU %.0f%%",
-                              hud_e2e_fps, hud_inf_fps, hud_cpu_pct);
-                int htw = font18 ? yvm::text_width(*font18, hud) : (int)std::strlen(hud) * 9;
-                int hth = font18 ? font18->line_height : 14;
+                // Two-line HUD panel, right-aligned values for a clean stat-block look:
+                //
+                //     ┌──────────────────────────┐
+                //     │  E2E    286 fps          │
+                //     │  Infer  286 fps          │
+                //     │  CPU       78 %          │
+                //     │  MEM       62 %          │
+                //     └──────────────────────────┘
+                FontAtlas* fhud = font24 ? font24 : font18;
+                struct Row { char label[16]; char value[24]; };
+                Row rows[4] = {};
+                std::snprintf(rows[0].label, sizeof rows[0].label, "E2E");
+                std::snprintf(rows[0].value, sizeof rows[0].value, "%.0f fps", hud_e2e_fps);
+                std::snprintf(rows[1].label, sizeof rows[1].label, "Infer");
+                std::snprintf(rows[1].value, sizeof rows[1].value, "%.0f fps", hud_inf_fps);
+                std::snprintf(rows[2].label, sizeof rows[2].label, "CPU");
+                std::snprintf(rows[2].value, sizeof rows[2].value, "%.0f %%",  hud_cpu_pct);
+                std::snprintf(rows[3].label, sizeof rows[3].label, "MEM");
+                std::snprintf(rows[3].value, sizeof rows[3].value, "%.0f %%",  hud_mem_pct);
+
+                const int rows_n   = 4;
+                const int pad_x    = 18;
+                const int pad_y    = 14;
+                const int gap_lbl  = 28;             // gap between label and value column
+                const int line_h   = fhud ? (fhud->line_height + 6) : 28;
+                int label_w = 0, value_w = 0;
+                for (int r = 0; r < rows_n; ++r) {
+                    int lw = fhud ? yvm::text_width(*fhud, rows[r].label) : (int)std::strlen(rows[r].label) * 12;
+                    int vw = fhud ? yvm::text_width(*fhud, rows[r].value) : (int)std::strlen(rows[r].value) * 12;
+                    if (lw > label_w) label_w = lw;
+                    if (vw > value_w) value_w = vw;
+                }
+                int panel_w = pad_x + label_w + gap_lbl + value_w + pad_x;
+                int panel_h = pad_y + rows_n * line_h + pad_y - 6;
+                int x0 = 12, y0 = 12;
                 yvm::fill_rect_alpha(composite.data(), comp_w, comp_h,
-                                     8, 8, 8 + htw + 16, 8 + hth + 6, 0, 0, 0, 180);
-                if (font18)
-                    yvm::draw_text_shadow(composite.data(), comp_w, comp_h, 16, 10, hud,
-                                          255, 255, 255, *font18);
+                                     x0, y0, x0 + panel_w, y0 + panel_h,
+                                     0, 0, 0, 200);
+                if (fhud) {
+                    int label_x = x0 + pad_x;
+                    int value_x = x0 + pad_x + label_w + gap_lbl;
+                    for (int r = 0; r < rows_n; ++r) {
+                        int y = y0 + pad_y + r * line_h;
+                        // Subtle grey label, bright white value — typical stat-block style.
+                        yvm::draw_text_shadow(composite.data(), comp_w, comp_h,
+                                              label_x, y, rows[r].label,
+                                              180, 180, 180, *fhud);
+                        // Right-align the value column.
+                        int vw = yvm::text_width(*fhud, rows[r].value);
+                        yvm::draw_text_shadow(composite.data(), comp_w, comp_h,
+                                              value_x + value_w - vw, y, rows[r].value,
+                                              255, 255, 255, *fhud);
+                    }
+                }
 
                 disp_slot.push(std::vector<uint8_t>(composite));
             }
