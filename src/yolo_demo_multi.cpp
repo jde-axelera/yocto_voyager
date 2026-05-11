@@ -67,7 +67,6 @@
 
 #include "axruntime/axruntime.h"
 
-#include "coco_names.h"
 #include "concurrency.h"
 #include "dma_heap.h"
 #include "drawing.h"
