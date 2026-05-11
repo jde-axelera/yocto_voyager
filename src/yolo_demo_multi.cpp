@@ -152,6 +152,15 @@ struct dma_heap_allocation_data {
 constexpr unsigned long DMA_HEAP_IOCTL_ALLOC =
     _IOWR('H', 0x0, struct dma_heap_allocation_data);
 
+// Round a request up to the system page size, matching what the Python
+// DmaBufAllocator does. The dma-heap driver enforces page-aligned allocations,
+// and passing a raw tensor size that isn't a multiple of the page size makes
+// either the alloc or the subsequent mmap fail.
+static size_t page_aligned(size_t n) {
+    static const size_t pg = (size_t)sysconf(_SC_PAGE_SIZE);
+    return ((n + pg - 1) / pg) * pg;
+}
+
 void alloc_worker_bufs(std::vector<WorkerBufs>& wb,
                        size_t in_size,
                        const std::vector<size_t>& out_sizes)
@@ -160,13 +169,14 @@ void alloc_worker_bufs(std::vector<WorkerBufs>& wb,
     if (heap_fd < 0) { std::perror("open dma_heap/system"); std::exit(1); }
 
     auto alloc_one = [&](size_t sz, int& fd_out, void*& ptr_out) {
+        size_t pa = page_aligned(sz);
         dma_heap_allocation_data a{};
-        a.len = sz;
+        a.len = pa;
         a.fd_flags = O_RDWR | O_CLOEXEC;
         if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0) {
             std::perror("worker dma alloc"); std::exit(1);
         }
-        void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, (int)a.fd, 0);
+        void* p = mmap(nullptr, pa, PROT_READ | PROT_WRITE, MAP_SHARED, (int)a.fd, 0);
         if (p == MAP_FAILED) { std::perror("worker mmap"); std::exit(1); }
         fd_out  = (int)a.fd;
         ptr_out = p;
@@ -186,10 +196,10 @@ void alloc_worker_bufs(std::vector<WorkerBufs>& wb,
 void free_worker_bufs(std::vector<WorkerBufs>& wb, size_t in_size,
                       const std::vector<size_t>& out_sizes) {
     for (auto& w : wb) {
-        if (w.in_ptr)      munmap(w.in_ptr, in_size);
+        if (w.in_ptr)      munmap(w.in_ptr, page_aligned(in_size));
         if (w.in_fd  >= 0) ::close(w.in_fd);
         for (size_t k = 0; k < w.out_fd.size(); ++k) {
-            if (w.out_ptr[k]) munmap(w.out_ptr[k], out_sizes[k]);
+            if (w.out_ptr[k]) munmap(w.out_ptr[k], page_aligned(out_sizes[k]));
             if (w.out_fd [k] >= 0) ::close(w.out_fd[k]);
         }
     }
