@@ -147,6 +147,31 @@ sh 05_run.sh ./yolo_demo_multi \
     --display 2
 ```
 
+**USB camera input** — any entry in `--inputs` of the form `usb:<N>` is opened as
+`/dev/video<N>` over V4L2 (MJPEG → BGR24). `--usb-size WxH` sets the capture
+resolution (default `640x480`) and `--fps` is used as the device framerate. You
+can pass several USB cameras, several files, or a mix — but all streams must
+end up at the same resolution.
+
+```sh
+# single Logitech / UVC webcam at 640x480 @ 30 fps
+sh 05_run.sh ./yolo_demo_multi \
+    --model    ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
+    --inputs   usb:0 \
+    --out      ~/cpp_test/multi_out/cam \
+    --usb-size 640x480 \
+    --fps      30 \
+    --display  2
+
+# two USB cameras side-by-side
+sh 05_run.sh ./yolo_demo_multi -m model.json -i usb:0,usb:2 -o /tmp/cams \
+    --usb-size 640x480 --fps 30 --display 2
+
+# mix file + USB camera (file must already be 640x480 here)
+sh 05_run.sh ./yolo_demo_multi -m model.json -i clip_640x480.mp4,usb:0 -o /tmp/mix \
+    --usb-size 640x480 --fps 30 --display 2
+```
+
 (Run `./yolo_demo_multi --help` for the full flag reference.)
 
 The run prints a `[stats]` line every 2 s with per-stream and aggregate FPS. Stop with **Ctrl-C** — every output MP4 closes cleanly with a valid `moov` atom.
@@ -176,11 +201,12 @@ ffplay -fflags nobuffer -flags low_delay -probesize 100k tcp://localhost:5050
 | Flag | Default | Meaning |
 |---|---|---|
 | `-m, --model PATH` | *required* | path to `model.json` or `.axm` (from `03_deploy_model.sh`) |
-| `-i, --inputs CSV` | *required* | 1–10 comma-separated input mp4 paths (must share resolution) |
+| `-i, --inputs CSV` | *required* | 1–10 comma-separated inputs. Each entry is either a file path (`.mp4` or anything ffmpeg can read) or `usb:<N>` for `/dev/video<N>`. All streams must share resolution. |
 | `-o, --out PREFIX` | *required* | output mp4 path prefix → writes `<PREFIX>_0.mp4 ... <PREFIX>_N-1.mp4` |
 | `--conf FLOAT` | `0.25` | detection confidence threshold |
 | `--iou FLOAT` | `0.45` | NMS IoU threshold |
-| `--fps N` | `25` | per-stream target FPS for `ffmpeg -re -r N` pacing |
+| `--fps N` | `25` | per-stream target FPS. For files: `ffmpeg -re -r N` pacing. For `usb:<N>`: device capture framerate. |
+| `--usb-size WxH` | `640x480` | capture resolution for any `usb:<N>` entry (UVC MJPEG). If you mix with a file, set this to match the file's resolution. |
 | `--preproc N` | `4` | preprocess thread count |
 | `-d, --display MODE` | `0` | `0`=file only, `1`=local X11 composite, `2`=TCP MPEG-TS composite on port 5000 |
 | `-b, --bench MODE` | `0` | `0`=full pipeline, `1`=skip draw+write, `2`=preproc+infer only |
