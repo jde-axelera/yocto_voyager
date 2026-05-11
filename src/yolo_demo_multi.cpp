@@ -97,12 +97,16 @@ std::atomic<bool> g_shutdown{false};
 void on_sig(int) { g_shutdown.store(true); }
 
 // Per-worker bookkeeping: a dma-heap input dmabuf (mapped both as a file
-// descriptor and a CPU pointer) plus heap-backed output buffers used by
-// axr_run_model_instance. Allocated once per worker for the lifetime of main().
+// descriptor and a CPU pointer) plus matching dma-heap output buffers — one per
+// model output tensor, each sized for a full batch. We use output_dmabuf=1
+// because the explore-latency sweep on Antelao shows dblbuf+odmabuf=1 hits
+// ~540 system fps vs ~425 fps with heap outputs. Allocated once per worker for
+// the lifetime of main().
 struct WorkerBufs {
-    int   in_fd  = -1;
-    void* in_ptr = nullptr;
-    std::vector<std::vector<int8_t>> out_heap;
+    int                in_fd  = -1;
+    void*              in_ptr = nullptr;
+    std::vector<int>   out_fd;     // one dmabuf fd per output tensor
+    std::vector<void*> out_ptr;    // matching mmap'd CPU pointer (for slicing into frames)
 };
 
 // Sample system-wide CPU% by diffing /proc/stat between two sample() calls.
@@ -154,26 +158,40 @@ void alloc_worker_bufs(std::vector<WorkerBufs>& wb,
 {
     int heap_fd = ::open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
     if (heap_fd < 0) { std::perror("open dma_heap/system"); std::exit(1); }
-    for (auto& w : wb) {
+
+    auto alloc_one = [&](size_t sz, int& fd_out, void*& ptr_out) {
         dma_heap_allocation_data a{};
-        a.len = in_size;
+        a.len = sz;
         a.fd_flags = O_RDWR | O_CLOEXEC;
         if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0) {
             std::perror("worker dma alloc"); std::exit(1);
         }
-        void* p = mmap(nullptr, in_size, PROT_READ | PROT_WRITE, MAP_SHARED, (int)a.fd, 0);
+        void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, (int)a.fd, 0);
         if (p == MAP_FAILED) { std::perror("worker mmap"); std::exit(1); }
-        w = WorkerBufs{ (int)a.fd, p, {} };
-        w.out_heap.resize(out_sizes.size());
-        for (size_t k = 0; k < out_sizes.size(); ++k) w.out_heap[k].resize(out_sizes[k]);
+        fd_out  = (int)a.fd;
+        ptr_out = p;
+    };
+
+    for (auto& w : wb) {
+        alloc_one(in_size, w.in_fd, w.in_ptr);
+        w.out_fd.resize(out_sizes.size());
+        w.out_ptr.resize(out_sizes.size());
+        for (size_t k = 0; k < out_sizes.size(); ++k) {
+            alloc_one(out_sizes[k], w.out_fd[k], w.out_ptr[k]);
+        }
     }
     ::close(heap_fd);
 }
 
-void free_worker_bufs(std::vector<WorkerBufs>& wb, size_t in_size) {
+void free_worker_bufs(std::vector<WorkerBufs>& wb, size_t in_size,
+                      const std::vector<size_t>& out_sizes) {
     for (auto& w : wb) {
-        if (w.in_ptr)            munmap(w.in_ptr, in_size);
-        if (w.in_fd  >= 0)       ::close(w.in_fd);
+        if (w.in_ptr)      munmap(w.in_ptr, in_size);
+        if (w.in_fd  >= 0) ::close(w.in_fd);
+        for (size_t k = 0; k < w.out_fd.size(); ++k) {
+            if (w.out_ptr[k]) munmap(w.out_ptr[k], out_sizes[k]);
+            if (w.out_fd [k] >= 0) ::close(w.out_fd[k]);
+        }
     }
 }
 
@@ -358,8 +376,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::string props = "input_dmabuf=1;num_sub_devices=" + std::to_string(batch)
-                      + ";aipu_cores="                    + std::to_string(batch)
+    std::string props = "input_dmabuf=1;output_dmabuf=1;num_sub_devices=" + std::to_string(batch)
+                      + ";aipu_cores="                                    + std::to_string(batch)
                       + ";double_buffer=1";
     axrProperties* properties = axr_create_properties(ctx, props.c_str());
 
@@ -538,10 +556,10 @@ int main(int argc, char** argv) {
             in_args[0].offset = 0;
             in_args[0].size   = in_size;
             for (size_t k = 0; k < n_out; ++k) {
-                out_args[k].ptr    = wb[i].out_heap[k].data();
-                out_args[k].size   = wb[i].out_heap[k].size();
-                out_args[k].fd     = 0;
+                out_args[k].ptr    = nullptr;
+                out_args[k].fd     = wb[i].out_fd[k];
                 out_args[k].offset = 0;
+                out_args[k].size   = out_sizes[k];
             }
 
             std::vector<FramePtr> batch_frames;
@@ -575,18 +593,28 @@ int main(int argc, char** argv) {
                     std::chrono::duration_cast<std::chrono::nanoseconds>(t_b - t_a).count(),
                     std::memory_order_relaxed);
 
+                // AIPU just wrote to the output dma-bufs; invalidate the CPU
+                // caches once per output before we slice into the per-frame
+                // heap copies. (Slicing is required because postproc consumes
+                // each frame's outputs independently and the dmabuf will be
+                // overwritten on the next axr call.)
+                for (size_t k = 0; k < n_out; ++k)
+                    InputBufferPool::sync_start_read(wb[i].out_fd[k]);
+
                 for (int b = 0; b < (int)batch_frames.size(); ++b) {
                     auto& f = batch_frames[b];
                     f->outputs.resize(n_out);
                     for (size_t k = 0; k < n_out; ++k) {
-                        f->outputs[k].assign(out_slot[k], 0);
+                        f->outputs[k].resize(out_slot[k]);
                         std::memcpy(f->outputs[k].data(),
-                                    wb[i].out_heap[k].data() + b * out_slot[k],
+                                    static_cast<uint8_t*>(wb[i].out_ptr[k]) + b * out_slot[k],
                                     out_slot[k]);
                     }
                     frames_inferred.fetch_add(1, std::memory_order_relaxed);
                     done_q.push(std::move(f));
                 }
+                for (size_t k = 0; k < n_out; ++k)
+                    InputBufferPool::sync_end_read(wb[i].out_fd[k]);
                 batch_frames.clear();
             };
 
@@ -873,7 +901,7 @@ int main(int argc, char** argv) {
         if (disp_producer.joinable()) disp_producer.join();
         if (disp_consumer.joinable()) disp_consumer.join();
     }
-    free_worker_bufs(wb, in_size);
+    free_worker_bufs(wb, in_size, out_sizes);
     axr_destroy(AXR_OBJECT(ctx));
     return 0;
 }

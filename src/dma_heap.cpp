@@ -84,4 +84,14 @@ void InputBufferPool::sync_end_write(int fd) {
     ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
 }
 
+void InputBufferPool::sync_start_read(int fd) {
+    dma_buf_sync s{ DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+}
+
+void InputBufferPool::sync_end_read(int fd) {
+    dma_buf_sync s{ DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
+}
+
 }  // namespace yvm

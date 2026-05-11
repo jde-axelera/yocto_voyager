@@ -54,6 +54,11 @@ public:
     static void sync_start_write(int fd);
     static void sync_end_write  (int fd);
 
+    /// device→CPU cache sync: call before/after a CPU read of data the AIPU
+    /// just wrote. Used for output dmabufs.
+    static void sync_start_read (int fd);
+    static void sync_end_read   (int fd);
+
 private:
     std::vector<Buf>         bufs_;
     std::queue<int>          free_;
