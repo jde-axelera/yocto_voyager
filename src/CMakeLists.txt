@@ -22,6 +22,7 @@ add_library(yolo_voyager_core STATIC
     yolo_postproc.cpp
     dma_heap.cpp
     subprocess.cpp
+    py_aipu_client.cpp
 )
 target_include_directories(yolo_voyager_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

@@ -73,6 +73,7 @@
 #include "drawing.h"
 #include "font.h"
 #include "frame.h"
+#include "py_aipu_client.h"
 #include "subprocess.h"
 #include "yolo_postproc.h"
 #include "yolo_preproc.h"
@@ -197,6 +198,12 @@ void print_usage(const char* prog) {
         "      --unpaced            drop ffmpeg's -re flag on file inputs so frames are\n"
         "                           decoded as fast as possible (benchmark mode). Ignored\n"
         "                           for usb:<N> inputs which are always device-paced.\n"
+        "      --py-dispatch        route axr_run_model_instance through a persistent\n"
+        "                           tools/aipu_worker.py side-car (recovers the runtime's\n"
+        "                           internal pipeline; matches axrunmodel's ~425+ fps).\n"
+        "                           Currently requires --bench 2 (outputs are not crossed\n"
+        "                           back over the Python boundary yet) and --workers 1.\n"
+        "      --py-worker PATH     path to aipu_worker.py (default tools/aipu_worker.py)\n"
         "      --preproc N          preprocess thread count (default 4)\n\n"
         "Display / output:\n"
         "  -d, --display MODE       0=file only (default)\n"
@@ -239,8 +246,11 @@ int main(int argc, char** argv) {
     int    usb_w           = 640;
     int    usb_h           = 480;
     bool   unpaced         = false;
+    bool   py_dispatch     = false;
+    std::string py_worker_path = "tools/aipu_worker.py";
 
-    enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE, OPT_UNPACED };
+    enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE,
+           OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER };
     static const struct option long_opts[] = {
         {"model",    required_argument, nullptr, 'm'},
         {"inputs",   required_argument, nullptr, 'i'},
@@ -250,8 +260,10 @@ int main(int argc, char** argv) {
         {"fps",      required_argument, nullptr, OPT_FPS},
         {"preproc",  required_argument, nullptr, OPT_PREPROC},
         {"usb-size", required_argument, nullptr, OPT_USB_SIZE},
-        {"unpaced",  no_argument,       nullptr, OPT_UNPACED},
-        {"display",  required_argument, nullptr, 'd'},
+        {"unpaced",     no_argument,       nullptr, OPT_UNPACED},
+        {"py-dispatch", no_argument,       nullptr, OPT_PY_DISPATCH},
+        {"py-worker",   required_argument, nullptr, OPT_PY_WORKER},
+        {"display",     required_argument, nullptr, 'd'},
         {"bench",    required_argument, nullptr, 'b'},
         {"workers",  required_argument, nullptr, 'w'},
         {"help",     no_argument,       nullptr, 'h'},
@@ -273,7 +285,9 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 break;
-            case OPT_UNPACED: unpaced       = true;                    break;
+            case OPT_UNPACED:    unpaced        = true;                 break;
+            case OPT_PY_DISPATCH: py_dispatch   = true;                 break;
+            case OPT_PY_WORKER:  py_worker_path = optarg;               break;
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
@@ -352,25 +366,44 @@ int main(int argc, char** argv) {
     if (n_in != 1) { std::fprintf(stderr, "expected 1 input\n"); return 1; }
     int batch = (int)in_infos[0].dims[0];
 
-    axrConnection* conn = axr_device_connect(ctx, nullptr, batch * N, nullptr);
-    if (!conn) {
-        std::fprintf(stderr, "device_connect: %s\n", axr_last_error_string(AXR_OBJECT(ctx)));
-        return 1;
-    }
-
-    std::string props = "input_dmabuf=1;num_sub_devices=" + std::to_string(batch)
-                      + ";aipu_cores="                    + std::to_string(batch)
-                      + ";double_buffer=1";
-    axrProperties* properties = axr_create_properties(ctx, props.c_str());
-
-    std::vector<axrModelInstance*> insts(N);
-    for (int i = 0; i < N; ++i) {
-        insts[i] = axr_load_model_instance(conn, model, properties);
-        if (!insts[i]) {
-            std::fprintf(stderr, "load_model_instance[%d]: %s\n", i,
+    // With --py-dispatch the AIPU is owned by the Python side-car; the C++
+    // context here is used only for tensor-info introspection.
+    axrConnection*               conn       = nullptr;
+    axrProperties*               properties = nullptr;
+    std::vector<axrModelInstance*> insts(N, nullptr);
+    std::string props;
+    if (!py_dispatch) {
+        conn = axr_device_connect(ctx, nullptr, batch * N, nullptr);
+        if (!conn) {
+            std::fprintf(stderr, "device_connect: %s\n",
                 axr_last_error_string(AXR_OBJECT(ctx)));
             return 1;
         }
+        props = "input_dmabuf=1;num_sub_devices=" + std::to_string(batch)
+              + ";aipu_cores="                    + std::to_string(batch)
+              + ";double_buffer=1";
+        properties = axr_create_properties(ctx, props.c_str());
+        for (int i = 0; i < N; ++i) {
+            insts[i] = axr_load_model_instance(conn, model, properties);
+            if (!insts[i]) {
+                std::fprintf(stderr, "load_model_instance[%d]: %s\n", i,
+                    axr_last_error_string(AXR_OBJECT(ctx)));
+                return 1;
+            }
+        }
+    } else {
+        if (N != 1) {
+            std::fprintf(stderr,
+                "ERROR: --py-dispatch only supports --workers 1\n");
+            return 2;
+        }
+        if (bench < 2) {
+            std::fprintf(stderr,
+                "ERROR: --py-dispatch currently requires --bench 2 (output\n"
+                "       tensors are not returned across the Python boundary yet).\n");
+            return 2;
+        }
+        props = "input_dmabuf=1;double_buffer=1 (via Python side-car)";
     }
 
     yvm::PreprocCtx pre_ctx = yvm::make_preproc(in_infos[0]);
@@ -436,6 +469,20 @@ int main(int argc, char** argv) {
 
     std::vector<WorkerBufs> wb(N);
     alloc_worker_bufs(wb, in_size, out_sizes);
+
+    // Start the Python side-car (after dma-bufs are allocated, so we can pass
+    // the input fd over SCM_RIGHTS). It loads the model + claims the AIPU.
+    yvm::PyAipuClient py_cli;
+    if (py_dispatch) {
+        std::fprintf(stderr, "[py-dispatch] starting %s ...\n", py_worker_path.c_str());
+        if (!py_cli.start(py_worker_path, model_path, batch, batch,
+                          (int)n_out, /*output_dmabuf=*/false,
+                          wb[0].in_fd, {})) {
+            std::fprintf(stderr, "[py-dispatch] worker setup failed\n");
+            return 1;
+        }
+        std::fprintf(stderr, "[py-dispatch] worker ready\n");
+    }
 
     std::atomic<int64_t> infer_ns_total{0};
     std::atomic<int>     frames_inferred{0};
@@ -562,14 +609,24 @@ int main(int argc, char** argv) {
                 InputBufferPool::sync_end_write(wb[i].in_fd);
 
                 auto t_a = clk::now();
-                axrResult r = axr_run_model_instance(insts[i],
-                    in_args.data(), in_args.size(),
-                    out_args.data(), out_args.size());
+                bool ok;
+                if (py_dispatch) {
+                    ok = py_cli.run_one();
+                } else {
+                    axrResult r = axr_run_model_instance(insts[i],
+                        in_args.data(), in_args.size(),
+                        out_args.data(), out_args.size());
+                    ok = (r == AXR_SUCCESS);
+                    if (!ok) {
+                        std::fprintf(stderr, "[worker %d] run failed: code=%d (%s) msg=%s\n",
+                            i, (int)r, axr_error_string(r),
+                            axr_last_error_string(AXR_OBJECT(ctx)));
+                    }
+                }
                 auto t_b = clk::now();
-                if (r != AXR_SUCCESS) {
-                    std::fprintf(stderr, "[worker %d] run failed: code=%d (%s) msg=%s\n",
-                        i, (int)r, axr_error_string(r),
-                        axr_last_error_string(AXR_OBJECT(ctx)));
+                if (!ok) {
+                    if (py_dispatch)
+                        std::fprintf(stderr, "[worker %d] py-dispatch run failed\n", i);
                     return;
                 }
                 infer_ns_total.fetch_add(
