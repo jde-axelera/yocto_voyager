@@ -236,8 +236,9 @@ void print_usage(const char* prog) {
         "                           (waylandsink fullscreen=true). Otherwise the window\n"
         "                           is borderless via Weston's server-side decorations\n"
         "                           and the user can drag-resize it freely.\n"
-        "      --no-annotate        skip per-stream postproc + box/label drawing. Streams\n"
-        "                           pass through clean; only the overall HUD remains.\n\n"
+        "      --boxes-only         draw per-stream colour-coded detection boxes on top\n"
+        "                           of each frame. Default is clean stream pass-through\n"
+        "                           with only the overall HUD on the composite.\n\n"
         "Diagnostic / advanced:\n"
         "  -b, --bench MODE         0=full pipeline (default)\n"
         "                           1=skip draw + write (postproc kept)\n"
@@ -277,12 +278,12 @@ int main(int argc, char** argv) {
     bool   unpaced         = false;
     bool   py_dispatch     = false;
     bool   fullscreen      = false;
-    bool   no_annotate     = false;
+    bool   boxes_only      = false;            // default: clean streams + HUD only
     std::string py_worker_path = "tools/aipu_worker.py";
 
     enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE,
            OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER, OPT_FULLSCREEN,
-           OPT_NO_ANNOTATE };
+           OPT_BOXES_ONLY };
     static const struct option long_opts[] = {
         {"model",    required_argument, nullptr, 'm'},
         {"inputs",   required_argument, nullptr, 'i'},
@@ -296,7 +297,7 @@ int main(int argc, char** argv) {
         {"py-dispatch", no_argument,       nullptr, OPT_PY_DISPATCH},
         {"py-worker",   required_argument, nullptr, OPT_PY_WORKER},
         {"fullscreen",  no_argument,       nullptr, OPT_FULLSCREEN},
-        {"no-annotate", no_argument,       nullptr, OPT_NO_ANNOTATE},
+        {"boxes-only",  no_argument,       nullptr, OPT_BOXES_ONLY},
         {"display",     required_argument, nullptr, 'd'},
         {"bench",    required_argument, nullptr, 'b'},
         {"workers",  required_argument, nullptr, 'w'},
@@ -323,7 +324,7 @@ int main(int argc, char** argv) {
             case OPT_PY_DISPATCH: py_dispatch   = true;                 break;
             case OPT_PY_WORKER:  py_worker_path = optarg;               break;
             case OPT_FULLSCREEN: fullscreen     = true;                 break;
-            case OPT_NO_ANNOTATE: no_annotate   = true;                 break;
+            case OPT_BOXES_ONLY:  boxes_only    = true;                 break;
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
@@ -749,10 +750,10 @@ int main(int argc, char** argv) {
                 s->pending.erase(it);
                 ++s->next_idx;
 
-                // With --no-annotate the per-stream postproc + box draw is skipped
-                // entirely. The streams pass through untouched and only the global
-                // HUD on the composite remains.
-                if (!no_annotate && bench < 2) {
+                // Default is clean stream pass-through; only the global HUD on
+                // the composite remains. Opt-in to per-stream colour-coded boxes
+                // with --boxes-only.
+                if (boxes_only && bench < 2) {
                     std::vector<const int8_t*> ptrs(cur->outputs.size());
                     for (size_t k = 0; k < cur->outputs.size(); ++k) ptrs[k] = cur->outputs[k].data();
                     dets.clear();
