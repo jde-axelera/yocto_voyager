@@ -1,10 +1,12 @@
 # yocto_voyager
 
-End-to-end **YOLOv11n inference pipeline** for the **Axelera Metis AIPU on an Antelao SoM (RK3588 + Voyager Linux)**, written in C++. Reads 1–10 H.264 input streams, paces each to a configurable FPS, runs object detection on the AIPU, draws bounding boxes + labels on every frame, and emits one annotated MP4 per stream **plus** an optional live composite 4×4 grid display (X11 locally or TCP MPEG-TS H.264 for remote viewing).
+End-to-end **YOLOv11n inference pipeline** for the **Axelera Metis AIPU on an Antelao SoM (RK3588 + Voyager Linux)**, written in C++. Reads 1–10 H.264 input streams, paces each to a configurable FPS, runs object detection on the AIPU, draws bounding boxes + labels on every frame, and emits one annotated MP4 per stream **plus** an optional live auto-sized composite grid display (X11 locally or TCP MPEG-TS H.264 for remote viewing).
 
-| Single-stream | 10-stream composite |
-|---|---|
-| ![](docs/images/single_stream.png) | ![](docs/images/composite_4x4.png) |
+| 1 stream (1×1) | 4 streams (2×2) | 10 streams (4×3) |
+|---|---|---|
+| ![](docs/images/grid_n1.png) | ![](docs/images/grid_n4.png) | ![](docs/images/grid_n10.png) |
+
+The composite display grid is auto-sized from the stream count: `cols = ⌈√N⌉`, `rows = ⌈N/cols⌉` (same shape `voyager-sdk`'s `display.App` window uses). With one stream the composite is the full source frame; with more streams each cell shrinks proportionally and unused cells stay black.
 
 ---
 
@@ -225,7 +227,7 @@ Key design choices:
 - **`double_buffer=1`** in axruntime properties.
 - **`output_dmabuf=0`** — the `axrunmodel --explore-latency` sweep shows host-allocated output buffers are fastest for our pipeline.
 - **Per-stream reorder buffer in the drawer.** Each `Stream` keeps its own `pending` map keyed by per-stream frame index, so the writer for stream N receives frames strictly in order.
-- **Display is fully decoupled from inference.** The drawer mutex-writes a snapshot of each stream's most recent annotated frame. A separate producer thread, paced at 30 Hz, decimates each snapshot 1/4 by nearest-neighbour and tiles it into a fixed 4×4 grid (16 cells; unused cells stay black). The composite is pushed through a **1-deep leaky slot** to a separate consumer thread that does atomic `write_full()` to the display subprocess and respawns it on viewer disconnect. Inference never blocks on the display path.
+- **Display is fully decoupled from inference.** The drawer mutex-writes a snapshot of each stream's most recent annotated frame. A separate producer thread, paced at 30 Hz, decimates each snapshot by integer nearest-neighbour (factors `cols`/`rows`) and tiles it into an **auto-sized grid** chosen as `cols = ⌈√N⌉, rows = ⌈N/cols⌉` (same shape `voyager-sdk`'s `display.App` uses): N=1 → 1×1 full window, N=4 → 2×2, N=10 → 4×3, etc. Unused cells stay black. The composite is pushed through a **1-deep leaky slot** to a separate consumer thread that does atomic `write_full()` to the display subprocess and respawns it on viewer disconnect. Inference never blocks on the display path.
 - **TTF text rendering**: `stb_truetype.h` (single-header, public domain) + `LiberationSans-Bold.ttf` baked as a C array. Pre-rasterised glyph atlases at 14 px (labels) and 18 px (HUD). Per-glyph blits use 8-bit alpha against the BGR frame buffer.
 - **Curated 80-class COCO palette** so the same class consistently gets the same colour.
 - **Graceful shutdown**: `SIGINT`/`SIGTERM` triggers an orderly drain — decoders return, queues close, all writer stdin fds are closed in parallel so every ffmpeg child can finalise its `moov` atom simultaneously, then we wait up to 15 s before SIGTERM/SIGKILL.

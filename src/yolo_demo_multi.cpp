@@ -615,10 +615,29 @@ int main(int argc, char** argv) {
     }
 
     // ---- composite display: producer @ 30 Hz, consumer with auto-respawn ----
+    //
+    // Grid is chosen automatically to fit N streams:
+    //
+    //     cols = ceil(sqrt(N))      rows = ceil(N / cols)      cells = cols * rows
+    //
+    // Examples (matches the layout voyager-sdk's display.App uses for an OpenGL window):
+    //   N=1  → 1x1  (single full-size view)
+    //   N=2  → 2x1
+    //   N=3  → 2x2  (one black cell)
+    //   N=4  → 2x2
+    //   N=5,6 → 3x2
+    //   N=7,8,9 → 3x3
+    //   N=10..12 → 4x3
+    //   N=13..16 → 4x4
+    //
+    // Each cell is the source frame downscaled by integer factors (scale_x=cols, scale_y=rows),
+    // so for N=1 the cell IS the source frame and no resize happens.
     LeakyOne<std::vector<uint8_t>> disp_slot;
     std::thread disp_producer, disp_consumer;
     std::atomic<bool> disp_stop{false};
-    const int GRID_COLS = 4, GRID_ROWS = 4;
+    const int N_streams = (int)streams.size();
+    const int GRID_COLS = (int)std::ceil(std::sqrt((double)N_streams));
+    const int GRID_ROWS = (int)std::ceil((double)N_streams / GRID_COLS);
     int cell_w = 0, cell_h = 0, comp_w = 0, comp_h = 0, scale_x = 0, scale_y = 0;
     if (live_display) {
         cell_w  = common_sw / GRID_COLS;
@@ -672,8 +691,9 @@ int main(int argc, char** argv) {
                 else
                     disp = yvm::ffmpeg_tcp_streamer(comp_w, comp_h, 30.0, 5000);
                 std::fprintf(stderr,
-                    "[display] composite pid=%d  %dx%d  4x4 grid  cell %dx%d  (scale 1/%dx1/%d)\n",
-                    (int)disp.pid, comp_w, comp_h, cell_w, cell_h, scale_x, scale_y);
+                    "[display] composite pid=%d  %dx%d  %dx%d grid  cell %dx%d  (scale 1/%dx1/%d)\n",
+                    (int)disp.pid, comp_w, comp_h, GRID_COLS, GRID_ROWS,
+                    cell_w, cell_h, scale_x, scale_y);
             };
             open_disp();
             std::vector<uint8_t> frame;
