@@ -13,9 +13,21 @@
 #   status,notes
 set -eu
 
-TASK="${1:?task required}"
+TASK_RAW="${1:?task required}"
 STEM="${2:?stem required}"
 TARBALL="${3:?tarball path required}"
+
+# Remap voyager-sdk task subdir names to the unified --task handlers.
+case "$TASK_RAW" in
+    object_detection|obb_detection)                  TASK=detection ;;
+    instance_segmentation|semantic_segmentation)     TASK=seg ;;
+    keypoint_detection)                              TASK=pose ;;
+    face_detection)                                  TASK=face ;;
+    embedding)                                       TASK=embed ;;
+    classification)                                  TASK=classify ;;
+    *)                                               TASK="$TASK_RAW" ;;
+esac
+echo "[bench] task=$TASK_RAW (→ --task $TASK)  stem=$STEM"
 BENCH="${4:---bench=2}"; BENCH="${BENCH#--bench=}"
 SECONDS_ARG="${5:---seconds=20}"; SECONDS_ARG="${SECONDS_ARG#--seconds=}"
 
