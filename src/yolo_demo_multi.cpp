@@ -762,6 +762,10 @@ int main(int argc, char** argv) {
                     auto kept = yvm::nms(std::move(dets), iou_thresh);
 
                     if (bench == 0) {
+                        // Boxes only — class label and confidence used to be drawn
+                        // as a small chip at the top-left corner of each box, but
+                        // those text bubbles clutter the view at small cell sizes.
+                        // Box colour already encodes the class (see class_color).
                         Image im{cur->bgr.data(), cur->sw, cur->sh};
                         for (const auto& d : kept) {
                             uint8_t bc, gc, rc;
@@ -769,20 +773,6 @@ int main(int argc, char** argv) {
                             int x1 = (int)d.x1, y1 = (int)d.y1,
                                 x2 = (int)d.x2, y2 = (int)d.y2;
                             yvm::draw_rect(im, x1, y1, x2, y2, bc, gc, rc, 2);
-                            char label[128];
-                            std::snprintf(label, sizeof label, "%s %d%%",
-                                          (d.cls >= 0 && d.cls < 80) ? COCO_NAMES[d.cls] : "?",
-                                          (int)(d.score * 100));
-                            int tw = font14 ? yvm::text_width(*font14, label) : (int)std::strlen(label) * 8;
-                            int th = font14 ? font14->line_height : 10;
-                            int ph = 4, pv = 1;
-                            int bw = tw + 2 * ph, bh = th + 2 * pv;
-                            int ly0 = y1 - bh; if (ly0 < 0) ly0 = y1 + 1;
-                            yvm::fill_rect_alpha(im.data, im.w, im.h,
-                                                 x1, ly0, x1 + bw, ly0 + bh, rc, gc, bc, 230);
-                            if (font14)
-                                yvm::draw_text_ttf(im.data, im.w, im.h, x1 + ph, ly0 + pv,
-                                                   label, 255, 255, 255, *font14);
                         }
                     }
                 }
