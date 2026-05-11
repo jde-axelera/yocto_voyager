@@ -1,0 +1,29 @@
+# build artifacts
+build/
+sysroot/
+wheels/
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# generated samples / output files
+*.mp4
+*.mov
+*.log
+*.tar.gz
+*.deb
+yolo11n_4c/
+multi_out/
+
+# CMake junk
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
