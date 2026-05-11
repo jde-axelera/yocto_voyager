@@ -313,13 +313,24 @@ After a clean Ctrl-C the files have valid `moov` atoms and play immediately in `
 ├── .gitignore
 ├── toolchain-aarch64.cmake          # cross-toolchain file for CMake
 ├── src/
-│   ├── yolo_demo_multi.cpp          # the one and only C++ source (~1300 lines)
 │   ├── CMakeLists.txt
+│   ├── yolo_demo_multi.cpp          # ~570-line orchestrator (argv parsing + thread launch)
+│   │
+│   │   ── pipeline modules ──
+│   ├── concurrency.h                # BoundedQueue + LeakyOne (header-only templates)
+│   ├── subprocess.h / .cpp          # Subprocess type + ffmpeg/gst-launch wiring
+│   ├── dma_heap.h / .cpp            # InputBufferPool + dma-heap ABI + cache sync
+│   ├── drawing.h / .cpp             # BGR draw primitives + class_color
+│   ├── font.h / .cpp                # TTF rasterizer (stb_truetype, Liberation Sans Bold)
+│   ├── yolo_preproc.h / .cpp        # letterbox + quantize into model input layout
+│   ├── yolo_postproc.h / .cpp       # DFL + sigmoid + class-aware NMS
+│   ├── frame.h                      # Frame and Stream structs
+│   │
+│   │   ── data ──
 │   ├── coco_names.h                 # 80 COCO class names
 │   ├── coco_palette.h               # curated 80-class colour palette
 │   ├── liberation_sans_bold.h       # TTF baked as a C uint8 array
-│   └── stb/
-│       └── stb_truetype.h           # public-domain TTF rasteriser
+│   └── stb/stb_truetype.h           # public-domain TTF rasteriser (single header)
 ├── scripts/
 │   ├── 01_update_driver.sh          # on SBC, as root: metis driver 1.4.4 -> 1.4.16
 │   ├── 02_install_runtime.sh        # on SBC: pip-install axelera-rt into a venv
@@ -332,6 +343,20 @@ After a clean Ctrl-C the files have valid `moov` atoms and play immediately in `
         ├── per_stream_hud.png
         └── composite_4x4.png
 ```
+
+### Code organization
+
+All non-trivial logic lives in the dedicated modules listed above. The C++
+binary is a single static library (`yolo_voyager_core`) plus a thin executable
+(`yolo_demo_multi`) that ties them together. Each module:
+
+- has a short header with one-line doc comments for every public symbol;
+- exposes its API in the `yvm::` namespace;
+- compiles in isolation against just its declared dependencies.
+
+If you want to reuse any piece of the pipeline elsewhere (the dma-heap pool, the
+TTF rasterizer, the YOLO decode/NMS, the subprocess wrappers), it's a drop-in
+include + link against the static library.
 
 ---
 
