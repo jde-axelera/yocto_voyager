@@ -569,7 +569,7 @@ int main(int argc, char** argv) {
             in_args[0].ptr    = nullptr;
             in_args[0].fd     = wb[i].in_fd;
             in_args[0].offset = 0;
-            in_args[0].size   = 0;
+            in_args[0].size   = in_size;  // input has always worked with the tensor size
             for (size_t k = 0; k < n_out; ++k) {
                 out_args[k].ptr    = nullptr;
                 out_args[k].fd     = wb[i].out_fd[k];
