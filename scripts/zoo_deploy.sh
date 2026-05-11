@@ -139,13 +139,18 @@ echo "[deploy] picked batch=$ACTUAL_CORES (requested $CORES)"
 TAR_OUT="$OUT_DIR/$STEM.tar.gz"
 echo "[deploy] tarring $BUILD/$ACTUAL_CORES → $TAR_OUT"
 # Build a tar list dynamically — only include files that actually exist.
+# `set -e` is on, so we explicitly swallow the test exit code.
 TAR_LIST=()
-add_if_exists() { [ -e "$SDK_DIR/build/$STEM/$1" ] && TAR_LIST+=("$1"); }
+add_if_exists() {
+    if [ -e "$SDK_DIR/build/$STEM/$1" ]; then
+        TAR_LIST+=("$1")
+    fi
+}
 add_if_exists "$STEM/$ACTUAL_CORES"          # batch dir (ELFs, model.json, const bins, etc.)
 add_if_exists "$STEM/compile_config.json"
 add_if_exists "$STEM/compiler_config.toml"
 add_if_exists "$STEM/model_info.json"
-add_if_exists "$STEM/quantized"              # required: contains a sibling manifest.json + postprocess_graph
+add_if_exists "$STEM/quantized"              # contains sibling manifest.json + postprocess_graph for many models
 ( cd "$SDK_DIR/build/$STEM" && \
   tar czf "$TAR_OUT" \
     --exclude="*.c" \
@@ -155,9 +160,13 @@ add_if_exists "$STEM/quantized"              # required: contains a sibling mani
     --exclude="*.npy" \
     "${TAR_LIST[@]}" \
     2>/dev/null ) || true
-ls -lh "$TAR_OUT" 2>/dev/null
-echo "[deploy] tarball contents:"
-tar tzf "$TAR_OUT" 2>/dev/null | head -20
+if [ -f "$TAR_OUT" ]; then
+    ls -lh "$TAR_OUT" 2>/dev/null || true
+    echo "[deploy] tarball contents:"
+    tar tzf "$TAR_OUT" 2>/dev/null | head -20 || true
+else
+    echo "[deploy] WARN: tar did not produce $TAR_OUT"
+fi
 
 # 4) Wipe the intermediate.
 rm -rf "$SDK_DIR/build/$STEM"
