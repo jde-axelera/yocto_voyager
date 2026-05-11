@@ -125,17 +125,33 @@ if [ -z "$ACTUAL_CORES" ]; then
 fi
 echo "[deploy] picked batch=$ACTUAL_CORES (requested $CORES)"
 
-# 3) Tar only the model.json + ELFs + manifest. Drop quantized debug/tmp.
+# 3) Tar everything the AIPU runtime needs at load time.
+#
+# Required:
+#   model.json, manifest.json, kernel_function*.elf, pool_ddr_const.bin,
+#   pool_l2_const.bin, postprocess_graph.onnx (if present).
+#
+# Excluded as bulk:
+#   kernel_function*.c            (source, runtime doesn't read them)
+#   quantized_model.pt            (PyTorch checkpoint, ~20MB, host-only)
+#   pool_ddr_input.bin            (sample inputs)
+#   any .png / .npy debug dumps
 TAR_OUT="$OUT_DIR/$STEM.tar.gz"
 echo "[deploy] tarring $BUILD/$ACTUAL_CORES → $TAR_OUT"
-tar czf "$TAR_OUT" \
-    -C "$SDK_DIR/build/$STEM" \
-    "$STEM/$ACTUAL_CORES/model.json" \
-    "$STEM/$ACTUAL_CORES/manifest.json" \
+( cd "$SDK_DIR/build/$STEM" && \
+  tar czf "$TAR_OUT" \
+    --exclude="*.c" \
+    --exclude="quantized_model.pt" \
+    --exclude="pool_ddr_input.bin" \
+    --exclude="*.png" \
+    --exclude="*.npy" \
+    "$STEM/$ACTUAL_CORES" \
     "$STEM/compile_config.json" \
     "$STEM/model_info.json" \
-    $(cd "$SDK_DIR/build/$STEM" && find "$STEM/$ACTUAL_CORES" -maxdepth 1 -name "*.elf" -print 2>/dev/null) \
-    2>/dev/null || true
+    2>/dev/null ) || true
+ls -lh "$TAR_OUT" 2>/dev/null
+echo "[deploy] tarball contents:"
+tar tzf "$TAR_OUT" 2>/dev/null | head -20
 
 # 4) Wipe the intermediate.
 rm -rf "$SDK_DIR/build/$STEM"
