@@ -4,9 +4,9 @@ End-to-end **YOLOv11n inference pipeline** for the **Axelera Metis AIPU on an An
 
 | 1 stream (1×1) | 4 streams (2×2) | 10 streams (4×3) |
 |---|---|---|
-| ![](docs/images/grid_n1.png) | ![](docs/images/grid_n4.png) | ![](docs/images/grid_n10.png) |
+| ![](docs/images/hud_grid_n1.png) | ![](docs/images/hud_grid_n4.png) | ![](docs/images/hud_grid_n10.png) |
 
-The composite display grid is auto-sized from the stream count: `cols = ⌈√N⌉`, `rows = ⌈N/cols⌉` (same shape `voyager-sdk`'s `display.App` window uses). With one stream the composite is the full source frame; with more streams each cell shrinks proportionally and unused cells stay black.
+The composite display grid is auto-sized from the stream count: `cols = ⌈√N⌉`, `rows = ⌈N/cols⌉` (same shape `voyager-sdk`'s `display.App` window uses). With one stream the composite is the full source frame; with more streams each cell shrinks proportionally and unused cells stay black. A single live HUD — **E2E fps · Infer fps · CPU %** — is overlaid once at the top-left of the composite (refreshed every second from `/proc/stat`), instead of one HUD per stream.
 
 ---
 
@@ -228,6 +228,7 @@ Key design choices:
 - **`output_dmabuf=0`** — the `axrunmodel --explore-latency` sweep shows host-allocated output buffers are fastest for our pipeline.
 - **Per-stream reorder buffer in the drawer.** Each `Stream` keeps its own `pending` map keyed by per-stream frame index, so the writer for stream N receives frames strictly in order.
 - **Display is fully decoupled from inference.** The drawer mutex-writes a snapshot of each stream's most recent annotated frame. A separate producer thread, paced at 30 Hz, decimates each snapshot by integer nearest-neighbour (factors `cols`/`rows`) and tiles it into an **auto-sized grid** chosen as `cols = ⌈√N⌉, rows = ⌈N/cols⌉` (same shape `voyager-sdk`'s `display.App` uses): N=1 → 1×1 full window, N=4 → 2×2, N=10 → 4×3, etc. Unused cells stay black. The composite is pushed through a **1-deep leaky slot** to a separate consumer thread that does atomic `write_full()` to the display subprocess and respawns it on viewer disconnect. Inference never blocks on the display path.
+- **Overall HUD overlaid once on the composite.** The producer thread also draws a single status line — *E2E fps · Infer fps · CPU %* — at the top-left of the composite (not per stream). Counters are sampled once per second by diffing per-stream `drawn`, the global `frames_inferred`, and `/proc/stat`. This keeps small cells uncluttered when N is large.
 - **TTF text rendering**: `stb_truetype.h` (single-header, public domain) + `LiberationSans-Bold.ttf` baked as a C array. Pre-rasterised glyph atlases at 14 px (labels) and 18 px (HUD). Per-glyph blits use 8-bit alpha against the BGR frame buffer.
 - **Curated 80-class COCO palette** so the same class consistently gets the same colour.
 - **Graceful shutdown**: `SIGINT`/`SIGTERM` triggers an orderly drain — decoders return, queues close, all writer stdin fds are closed in parallel so every ffmpeg child can finalise its `moov` atom simultaneously, then we wait up to 15 s before SIGTERM/SIGKILL.
@@ -344,9 +345,9 @@ After a clean Ctrl-C the files have valid `moov` atoms and play immediately in `
 │   └── 05_run.sh                    # on SBC: convenience wrapper around the binary
 └── docs/
     └── images/
-        ├── single_stream.png
-        ├── per_stream_hud.png
-        └── composite_4x4.png
+        ├── hud_grid_n1.png               # composite, N=1 (1x1) with overall HUD
+        ├── hud_grid_n4.png               # composite, N=4 (2x2) with overall HUD
+        └── hud_grid_n10.png              # composite, N=10 (4x3) with overall HUD
 ```
 
 ### Code organization
