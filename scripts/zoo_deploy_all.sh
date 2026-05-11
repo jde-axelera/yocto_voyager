@@ -23,13 +23,17 @@ fi
 JOBS=(
     "object_detection|yolo11n-coco-onnx|4"
     "classification|mobilenetv2-imagenet-onnx|1"
-    "instance_segmentation|yolov8nseg-coco-onnx|4"
     "keypoint_detection|yolov8npose-coco-onnx|4"
     "obb_detection|yolo11nobb-coco-onnx|4"
-    "semantic_segmentation|unet_fcn_512-cityscapes|4"
     "face_detection|retinaface-mobilenet0.25-widerface-onnx|4"
     "embedding|osnet-x1-0-market1501-onnx|4"
+    "instance_segmentation|yolov8nseg-coco-onnx|4"
+    "semantic_segmentation|unet_fcn_512-cityscapes|4"
 )
+
+# Per-deploy wall-clock guard (seconds). Voyager deploys for segmentation
+# routinely run 30-40 min single-threaded; we time-bound the whole zoo run.
+DEPLOY_TIMEOUT_S="${DEPLOY_TIMEOUT_S:-900}"
 
 for j in "${JOBS[@]}"; do
     IFS='|' read -r TASK STEM CORES <<< "$j"
@@ -37,10 +41,23 @@ for j in "${JOBS[@]}"; do
         echo "[skip] $TASK/$STEM already in deploys/"
         continue
     fi
-    echo "=== [$(date +%H:%M:%S)] deploying $TASK / $STEM (cores=$CORES) ==="
+    echo "=== [$(date +%H:%M:%S)] deploying $TASK / $STEM (cores=$CORES, budget=${DEPLOY_TIMEOUT_S}s) ==="
     t0=$(date +%s)
-    SDK_DIR="$SDK_DIR" bash "$REPO_ROOT/scripts/zoo_deploy.sh" "$TASK" "$STEM" --cores="$CORES"
-    rc=$?
+    # Soft watchdog: spawn the deploy in a subshell with a timeout. If we
+    # don't have GNU `timeout` available, fall back to a manual kill.
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --kill-after=60 "$DEPLOY_TIMEOUT_S" \
+            bash -c "SDK_DIR='$SDK_DIR' bash '$REPO_ROOT/scripts/zoo_deploy.sh' '$TASK' '$STEM' --cores='$CORES'"
+        rc=$?
+    else
+        ( SDK_DIR="$SDK_DIR" bash "$REPO_ROOT/scripts/zoo_deploy.sh" "$TASK" "$STEM" --cores="$CORES" ) &
+        deploy_pid=$!
+        ( sleep "$DEPLOY_TIMEOUT_S"; kill -KILL $deploy_pid 2>/dev/null; pkill -KILL -P $deploy_pid 2>/dev/null ) &
+        wd_pid=$!
+        wait $deploy_pid
+        rc=$?
+        kill -KILL $wd_pid 2>/dev/null || true
+    fi
     t1=$(date +%s); dur=$((t1 - t0))
     tar="$REPO_ROOT/deploys/$TASK/$STEM.tar.gz"
     if [ "$rc" = 0 ] && [ -f "$tar" ]; then
