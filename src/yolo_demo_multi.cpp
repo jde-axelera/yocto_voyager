@@ -560,16 +560,21 @@ int main(int argc, char** argv) {
             std::vector<size_t> out_slot(n_out);
             for (size_t k = 0; k < n_out; ++k) out_slot[k] = out_sizes[k] / B;
 
+            // axrArgument convention (from Python's axelera.runtime._as_arg):
+            // for dmabuf-fd arguments, size is 0 — the runtime uses the model's
+            // declared tensor size, not whatever we pass. For host-pointer args,
+            // size is the buffer's nbytes. Passing nonzero size on a dmabuf arg
+            // makes axr_run_model_instance return AXR_UNKNOWN_ERROR.
             std::vector<axrArgument> in_args(1), out_args(n_out);
             in_args[0].ptr    = nullptr;
             in_args[0].fd     = wb[i].in_fd;
             in_args[0].offset = 0;
-            in_args[0].size   = in_size;
+            in_args[0].size   = 0;
             for (size_t k = 0; k < n_out; ++k) {
                 out_args[k].ptr    = nullptr;
                 out_args[k].fd     = wb[i].out_fd[k];
                 out_args[k].offset = 0;
-                out_args[k].size   = out_sizes[k];
+                out_args[k].size   = 0;
             }
 
             std::vector<FramePtr> batch_frames;
