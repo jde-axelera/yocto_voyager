@@ -208,8 +208,12 @@ void print_usage(const char* prog) {
         "      --preproc N          preprocess thread count (default 4)\n\n"
         "Display / output:\n"
         "  -d, --display MODE       0=file only (default)\n"
-        "                           1=local X11 composite (DISPLAY=:0)\n"
-        "                           2=TCP MPEG-TS H.264 composite on port 5000\n\n"
+        "                           1=local Wayland composite (waylandsink)\n"
+        "                           2=TCP MPEG-TS H.264 composite on port 5000\n"
+        "      --fullscreen         when --display 1, request a fullscreen window\n"
+        "                           (waylandsink fullscreen=true). Otherwise the window\n"
+        "                           is borderless via Weston's server-side decorations\n"
+        "                           and the user can drag-resize it freely.\n\n"
         "Diagnostic / advanced:\n"
         "  -b, --bench MODE         0=full pipeline (default)\n"
         "                           1=skip draw + write (postproc kept)\n"
@@ -248,10 +252,11 @@ int main(int argc, char** argv) {
     int    usb_h           = 480;
     bool   unpaced         = false;
     bool   py_dispatch     = false;
+    bool   fullscreen      = false;
     std::string py_worker_path = "tools/aipu_worker.py";
 
     enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE,
-           OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER };
+           OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER, OPT_FULLSCREEN };
     static const struct option long_opts[] = {
         {"model",    required_argument, nullptr, 'm'},
         {"inputs",   required_argument, nullptr, 'i'},
@@ -264,6 +269,7 @@ int main(int argc, char** argv) {
         {"unpaced",     no_argument,       nullptr, OPT_UNPACED},
         {"py-dispatch", no_argument,       nullptr, OPT_PY_DISPATCH},
         {"py-worker",   required_argument, nullptr, OPT_PY_WORKER},
+        {"fullscreen",  no_argument,       nullptr, OPT_FULLSCREEN},
         {"display",     required_argument, nullptr, 'd'},
         {"bench",    required_argument, nullptr, 'b'},
         {"workers",  required_argument, nullptr, 'w'},
@@ -289,6 +295,7 @@ int main(int argc, char** argv) {
             case OPT_UNPACED:    unpaced        = true;                 break;
             case OPT_PY_DISPATCH: py_dispatch   = true;                 break;
             case OPT_PY_WORKER:  py_worker_path = optarg;               break;
+            case OPT_FULLSCREEN: fullscreen     = true;                 break;
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
@@ -887,7 +894,8 @@ int main(int argc, char** argv) {
             Subprocess disp{};
             auto open_disp = [&]() {
                 if (live_display == 1)
-                    disp = yvm::gst_local_display(comp_w, comp_h, 30.0, "yolo11n multi");
+                    disp = yvm::gst_local_display(comp_w, comp_h, 30.0,
+                                                  "yolo11n multi", fullscreen);
                 else
                     disp = yvm::ffmpeg_tcp_streamer(comp_w, comp_h, 30.0, 5000);
                 std::fprintf(stderr,

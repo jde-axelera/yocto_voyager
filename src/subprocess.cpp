@@ -119,7 +119,8 @@ Subprocess ffmpeg_writer(const std::string& path, int w, int h, double fps) {
     return Subprocess{pid, pipefd[1]};
 }
 
-Subprocess gst_local_display(int w, int h, double fps, const char* /*title*/) {
+Subprocess gst_local_display(int w, int h, double fps, const char* /*title*/,
+                             bool fullscreen) {
     int pipefd[2];
     if (pipe(pipefd) < 0) { std::perror("pipe"); std::exit(1); }
     pid_t pid = fork();
@@ -131,13 +132,20 @@ Subprocess gst_local_display(int w, int h, double fps, const char* /*title*/) {
         std::snprintf(w_arg, sizeof w_arg, "width=%d", w);
         std::snprintf(h_arg, sizeof h_arg, "height=%d", h);
         std::snprintf(r_arg, sizeof r_arg, "framerate=%d/1", (int)std::round(fps));
+        // waylandsink with explicit fullscreen toggle. Weston provides server-
+        // side window decorations, so windowed mode is user-resizable out of
+        // the box. `sync=false` keeps frames moving when we're producing
+        // faster than the monitor refresh.
+        const char* sink_name = "waylandsink";
+        const char* fs_prop   = fullscreen ? "fullscreen=true" : "fullscreen=false";
+        const char* sync_prop = "sync=false";
         const char* argv_gst[] = {
             "gst-launch-1.0", "-q",
             "fdsrc", "fd=0", "!",
             "rawvideoparse", "format=bgr", w_arg, h_arg, r_arg, "!",
             "queue", "max-size-buffers=2", "leaky=downstream", "!",
             "videoconvert", "!",
-            "autovideosink", "sync=false",
+            sink_name, fs_prop, sync_prop,
             nullptr
         };
         execvp(argv_gst[0], (char* const*)argv_gst);

@@ -48,9 +48,18 @@ Subprocess ffmpeg_v4l2_reader(const std::string& device, int w, int h, int fps);
 /// Spawn ffmpeg as a raw-BGR writer to an MP4 file using the Rockchip MPP H.264 encoder.
 Subprocess ffmpeg_writer(const std::string& path, int w, int h, double fps);
 
-/// Spawn gst-launch-1.0 to display raw BGR on the local X server (DISPLAY=:0).
-/// Pipeline: fdsrc fd=0 ! rawvideoparse ! queue leaky=downstream ! videoconvert ! autovideosink sync=false
-Subprocess gst_local_display(int w, int h, double fps, const char* title);
+/// Spawn gst-launch-1.0 to display raw BGR on the local display.
+///
+/// Pipeline (Wayland-first, since Voyager Linux ships with Weston):
+///   fdsrc fd=0 ! rawvideoparse format=bgr ! queue leaky=downstream
+///     ! videoconvert ! waylandsink fullscreen=<fullscreen>
+///
+/// The Weston compositor provides server-side window decorations, so when
+/// `fullscreen=false` the window has a title bar + resize handles and the user
+/// can drag-resize it freely. When `fullscreen=true` the sink uses Wayland's
+/// xdg-shell `set_fullscreen` request and the video fills the monitor.
+Subprocess gst_local_display(int w, int h, double fps, const char* title,
+                             bool fullscreen = false);
 
 /// Spawn ffmpeg as a TCP MPEG-TS H.264 listener on the given port.
 /// The first connecting client receives the H.264 stream; the encoder is h264_rkmpp.
