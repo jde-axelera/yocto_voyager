@@ -182,12 +182,18 @@ void print_usage(const char* prog) {
         "Usage: %s --model PATH --inputs CSV --out PREFIX [options]\n\n"
         "Required:\n"
         "  -m, --model PATH         path to model.json or .axm\n"
-        "  -i, --inputs CSV         1..10 comma-separated input mp4 paths\n"
+        "  -i, --inputs CSV         1..10 comma-separated inputs. Each entry is one of:\n"
+        "                             <path>            .mp4 / any ffmpeg-readable file\n"
+        "                             usb:<N>           /dev/video<N> UVC camera (MJPEG)\n"
         "  -o, --out PREFIX         output mp4 path prefix (writes <PREFIX>_0.mp4 ...)\n\n"
         "Tuning:\n"
         "      --conf FLOAT         detection confidence threshold (default 0.25)\n"
         "      --iou FLOAT          NMS IoU threshold (default 0.45)\n"
-        "      --fps N              per-stream target fps for ffmpeg -re -r N (default 25)\n"
+        "      --fps N              per-stream target fps for ffmpeg -re -r N (default 25);\n"
+        "                           for usb:<N> inputs this is the capture framerate.\n"
+        "      --usb-size WxH       USB-camera capture size (default 640x480). All streams\n"
+        "                           must share dimensions, so if mixing with a file, set this\n"
+        "                           to match the file's resolution.\n"
         "      --preproc N          preprocess thread count (default 4)\n\n"
         "Display / output:\n"
         "  -d, --display MODE       0=file only (default)\n"
@@ -202,8 +208,10 @@ void print_usage(const char* prog) {
         "  -h, --help               show this help and exit\n\n"
         "Examples:\n"
         "  %s -m model.json -i clip.mp4 -o /tmp/out\n"
-        "  %s -m model.json -i v1.mp4,v2.mp4,v3.mp4,v4.mp4 -o /tmp/s --display 2 --fps 25\n",
-        prog, prog, prog);
+        "  %s -m model.json -i v1.mp4,v2.mp4,v3.mp4,v4.mp4 -o /tmp/s --display 2 --fps 25\n"
+        "  %s -m model.json -i usb:0 -o /tmp/cam --display 2 --usb-size 1280x720 --fps 30\n"
+        "  %s -m model.json -i usb:0,usb:2,v1.mp4 -o /tmp/mix --usb-size 848x480 --display 2\n",
+        prog, prog, prog, prog, prog);
 }
 
 }  // namespace
@@ -225,21 +233,24 @@ int main(int argc, char** argv) {
     int    preproc_threads = 4;
     int    live_display    = 0;
     int    target_fps      = 25;
+    int    usb_w           = 640;
+    int    usb_h           = 480;
 
-    enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC };
+    enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE };
     static const struct option long_opts[] = {
-        {"model",   required_argument, nullptr, 'm'},
-        {"inputs",  required_argument, nullptr, 'i'},
-        {"out",     required_argument, nullptr, 'o'},
-        {"conf",    required_argument, nullptr, OPT_CONF},
-        {"iou",     required_argument, nullptr, OPT_IOU},
-        {"fps",     required_argument, nullptr, OPT_FPS},
-        {"preproc", required_argument, nullptr, OPT_PREPROC},
-        {"display", required_argument, nullptr, 'd'},
-        {"bench",   required_argument, nullptr, 'b'},
-        {"workers", required_argument, nullptr, 'w'},
-        {"help",    no_argument,       nullptr, 'h'},
-        {nullptr,   0,                 nullptr, 0  }
+        {"model",    required_argument, nullptr, 'm'},
+        {"inputs",   required_argument, nullptr, 'i'},
+        {"out",      required_argument, nullptr, 'o'},
+        {"conf",     required_argument, nullptr, OPT_CONF},
+        {"iou",      required_argument, nullptr, OPT_IOU},
+        {"fps",      required_argument, nullptr, OPT_FPS},
+        {"preproc",  required_argument, nullptr, OPT_PREPROC},
+        {"usb-size", required_argument, nullptr, OPT_USB_SIZE},
+        {"display",  required_argument, nullptr, 'd'},
+        {"bench",    required_argument, nullptr, 'b'},
+        {"workers",  required_argument, nullptr, 'w'},
+        {"help",     no_argument,       nullptr, 'h'},
+        {nullptr,    0,                 nullptr, 0  }
     };
     int opt;
     while ((opt = getopt_long(argc, argv, "m:i:o:d:b:w:h", long_opts, nullptr)) != -1) {
@@ -251,6 +262,12 @@ int main(int argc, char** argv) {
             case OPT_IOU:     iou_thresh      = std::atof(optarg);     break;
             case OPT_FPS:     target_fps      = std::atoi(optarg);     break;
             case OPT_PREPROC: preproc_threads = std::atoi(optarg);     break;
+            case OPT_USB_SIZE:
+                if (std::sscanf(optarg, "%dx%d", &usb_w, &usb_h) != 2 || usb_w <= 0 || usb_h <= 0) {
+                    std::fprintf(stderr, "ERROR: --usb-size must be WxH (e.g. 640x480)\n");
+                    return 2;
+                }
+                break;
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
@@ -357,16 +374,34 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < n_out; ++i) out_sizes[i] = axr_tensor_size(&out_infos[i]);
 
     // ---- per-stream ffmpeg I/O + verify all streams share dims ----
+    //
+    // Each entry in --inputs is either a file path or a usb:<N> URI; the latter
+    // is opened via V4L2 at --usb-size / --fps. All streams must end up at the
+    // same resolution because the model preproc + composite grid assume uniform
+    // per-stream dims.
     int common_sw = 0, common_sh = 0;
     double common_fps = (double)target_fps;
     for (auto& s : streams) {
-        int64_t nf = 0;
-        s->reader = yvm::ffmpeg_reader(s->in_path, s->sw, s->sh, s->fps_in, nf, target_fps);
-        s->nframes = nf;
+        bool is_usb = s->in_path.rfind("usb:", 0) == 0;
+        if (is_usb) {
+            int dev_idx = std::atoi(s->in_path.c_str() + 4);
+            char dev_path[32];
+            std::snprintf(dev_path, sizeof dev_path, "/dev/video%d", dev_idx);
+            s->sw      = usb_w;
+            s->sh      = usb_h;
+            s->fps_in  = (double)target_fps;
+            s->nframes = 0;  // live source, unbounded
+            s->reader  = yvm::ffmpeg_v4l2_reader(dev_path, usb_w, usb_h, target_fps);
+        } else {
+            int64_t nf = 0;
+            s->reader = yvm::ffmpeg_reader(s->in_path, s->sw, s->sh, s->fps_in, nf, target_fps);
+            s->nframes = nf;
+        }
         if (common_sw == 0) { common_sw = s->sw; common_sh = s->sh; }
         else if (common_sw != s->sw || common_sh != s->sh) {
             std::fprintf(stderr,
-                "ERROR: stream %d is %dx%d but stream 0 is %dx%d (all inputs must match)\n",
+                "ERROR: stream %d is %dx%d but stream 0 is %dx%d (all inputs must match;\n"
+                "       for usb:<N> sources, use --usb-size WxH to match the other inputs)\n",
                 s->id, s->sw, s->sh, common_sw, common_sh);
             return 1;
         }

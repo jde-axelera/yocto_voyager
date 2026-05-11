@@ -32,6 +32,17 @@ bool probe_video(const std::string& path, int& w, int& h, double& fps, int64_t& 
 Subprocess ffmpeg_reader(const std::string& path, int& w, int& h, double& fps,
                          int64_t& nframes, int target_fps);
 
+/// Spawn ffmpeg as a V4L2 USB-camera raw-BGR reader.
+///
+///   ffmpeg -f v4l2 -input_format mjpeg -framerate <fps> -video_size <wxh>
+///          -i /dev/videoN -f rawvideo -pix_fmt bgr24 -
+///
+/// MJPEG is used as the on-the-wire format so the higher resolutions / framerates
+/// supported by most UVC webcams (e.g. Logitech C-series) are reachable. ffmpeg
+/// decodes MJPEG and converts to BGR24 in software. There is no EOF for a USB
+/// source — the pipe stays open until the parent closes the read end.
+Subprocess ffmpeg_v4l2_reader(const std::string& device, int w, int h, int fps);
+
 /// Spawn ffmpeg as a raw-BGR writer to an MP4 file using the Rockchip MPP H.264 encoder.
 Subprocess ffmpeg_writer(const std::string& path, int w, int h, double fps);
 

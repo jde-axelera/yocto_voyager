@@ -64,6 +64,32 @@ Subprocess ffmpeg_reader(const std::string& path, int& w, int& h, double& fps,
     return Subprocess{pid, pipefd[0]};
 }
 
+Subprocess ffmpeg_v4l2_reader(const std::string& device, int w, int h, int fps) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) { std::perror("pipe"); std::exit(1); }
+    pid_t pid = fork();
+    if (pid == 0) {
+        ::close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        ::close(pipefd[1]);
+        char size[32], rate[32];
+        std::snprintf(size, sizeof size, "%dx%d", w, h);
+        std::snprintf(rate, sizeof rate, "%d",    fps);
+        execlp("ffmpeg",
+               "ffmpeg", "-loglevel", "error",
+               "-f", "v4l2",
+               "-input_format", "mjpeg",
+               "-framerate",    rate,
+               "-video_size",   size,
+               "-i", device.c_str(),
+               "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+               (char*)nullptr);
+        _exit(127);
+    }
+    ::close(pipefd[1]);
+    return Subprocess{pid, pipefd[0]};
+}
+
 Subprocess ffmpeg_writer(const std::string& path, int w, int h, double fps) {
     int pipefd[2];
     if (pipe(pipefd) < 0) { std::perror("pipe"); std::exit(1); }
