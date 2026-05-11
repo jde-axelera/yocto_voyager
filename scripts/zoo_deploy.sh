@@ -138,6 +138,14 @@ echo "[deploy] picked batch=$ACTUAL_CORES (requested $CORES)"
 #   any .png / .npy debug dumps
 TAR_OUT="$OUT_DIR/$STEM.tar.gz"
 echo "[deploy] tarring $BUILD/$ACTUAL_CORES → $TAR_OUT"
+# Build a tar list dynamically — only include files that actually exist.
+TAR_LIST=()
+add_if_exists() { [ -e "$SDK_DIR/build/$STEM/$1" ] && TAR_LIST+=("$1"); }
+add_if_exists "$STEM/$ACTUAL_CORES"          # batch dir (ELFs, model.json, const bins, etc.)
+add_if_exists "$STEM/compile_config.json"
+add_if_exists "$STEM/compiler_config.toml"
+add_if_exists "$STEM/model_info.json"
+add_if_exists "$STEM/quantized"              # required: contains a sibling manifest.json + postprocess_graph
 ( cd "$SDK_DIR/build/$STEM" && \
   tar czf "$TAR_OUT" \
     --exclude="*.c" \
@@ -145,9 +153,7 @@ echo "[deploy] tarring $BUILD/$ACTUAL_CORES → $TAR_OUT"
     --exclude="pool_ddr_input.bin" \
     --exclude="*.png" \
     --exclude="*.npy" \
-    "$STEM/$ACTUAL_CORES" \
-    "$STEM/compile_config.json" \
-    "$STEM/model_info.json" \
+    "${TAR_LIST[@]}" \
     2>/dev/null ) || true
 ls -lh "$TAR_OUT" 2>/dev/null
 echo "[deploy] tarball contents:"
