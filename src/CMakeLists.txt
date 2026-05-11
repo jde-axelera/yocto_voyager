@@ -23,6 +23,8 @@ add_library(yolo_voyager_core STATIC
     dma_heap.cpp
     subprocess.cpp
     py_aipu_client.cpp
+    task_factory.cpp
+    tasks/detection.cpp
 )
 target_include_directories(yolo_voyager_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

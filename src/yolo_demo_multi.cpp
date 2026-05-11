@@ -75,6 +75,7 @@
 #include "frame.h"
 #include "py_aipu_client.h"
 #include "subprocess.h"
+#include "task.h"
 #include "yolo_postproc.h"
 #include "yolo_preproc.h"
 
@@ -209,6 +210,9 @@ void print_usage(const char* prog) {
         "                             <path>            .mp4 / any ffmpeg-readable file\n"
         "                             usb:<N>           /dev/video<N> UVC camera (MJPEG)\n"
         "  -o, --out PREFIX         output mp4 path prefix (writes <PREFIX>_0.mp4 ...)\n\n"
+        "Task selection:\n"
+        "      --task NAME          model-zoo task class. Default 'detection'.\n"
+        "                           See `src/task_factory.cpp` for the full list.\n\n"
         "Tuning:\n"
         "      --conf FLOAT         detection confidence threshold (default 0.25)\n"
         "      --iou FLOAT          NMS IoU threshold (default 0.45)\n"
@@ -279,11 +283,12 @@ int main(int argc, char** argv) {
     bool   py_dispatch     = false;
     bool   fullscreen      = false;
     bool   boxes_only      = false;            // default: clean streams + HUD only
+    std::string task_name   = "detection";     // model-zoo task class (see task_factory.cpp)
     std::string py_worker_path = "tools/aipu_worker.py";
 
     enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE,
            OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER, OPT_FULLSCREEN,
-           OPT_BOXES_ONLY };
+           OPT_BOXES_ONLY, OPT_TASK };
     static const struct option long_opts[] = {
         {"model",    required_argument, nullptr, 'm'},
         {"inputs",   required_argument, nullptr, 'i'},
@@ -298,6 +303,7 @@ int main(int argc, char** argv) {
         {"py-worker",   required_argument, nullptr, OPT_PY_WORKER},
         {"fullscreen",  no_argument,       nullptr, OPT_FULLSCREEN},
         {"boxes-only",  no_argument,       nullptr, OPT_BOXES_ONLY},
+        {"task",        required_argument, nullptr, OPT_TASK},
         {"display",     required_argument, nullptr, 'd'},
         {"bench",    required_argument, nullptr, 'b'},
         {"workers",  required_argument, nullptr, 'w'},
@@ -325,6 +331,7 @@ int main(int argc, char** argv) {
             case OPT_PY_WORKER:  py_worker_path = optarg;               break;
             case OPT_FULLSCREEN: fullscreen     = true;                 break;
             case OPT_BOXES_ONLY:  boxes_only    = true;                 break;
+            case OPT_TASK:        task_name     = optarg;               break;
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
@@ -438,8 +445,16 @@ int main(int argc, char** argv) {
         props = "input_dmabuf=1;output_dmabuf=1;double_buffer=1 (via Python side-car)";
     }
 
-    yvm::PreprocCtx pre_ctx = yvm::make_preproc(in_infos[0]);
-    auto out_tbl = yvm::classify_outputs(out_infos);
+    // Construct the task handler and let it cache any model-derived state
+    // (preproc layout, output classification, label tables).
+    std::unique_ptr<yvm::TaskHandler> task = yvm::make_task(task_name);
+    if (!task) {
+        std::fprintf(stderr, "ERROR: unknown --task '%s' (known: %s)\n",
+                     task_name.c_str(), yvm::known_task_names());
+        return 2;
+    }
+    task->init(model, in_infos, out_infos);
+
     const size_t in_size = axr_tensor_size(&in_infos[0]);
     std::vector<size_t> out_sizes(n_out);
     for (size_t i = 0; i < n_out; ++i) out_sizes[i] = axr_tensor_size(&out_infos[i]);
@@ -618,9 +633,9 @@ int main(int argc, char** argv) {
                 f->in_args.assign(1, {});
                 f->out_args.assign(n_out, {});
                 f->input.assign(in_size / batch, 0);
-                yvm::preprocess(f->bgr.data(), f->sw, f->sh,
-                                reinterpret_cast<int8_t*>(f->input.data()),
-                                pre_ctx, f->lscale, f->padx, f->pady);
+                task->preproc(f->bgr.data(), f->sw, f->sh,
+                              reinterpret_cast<int8_t*>(f->input.data()),
+                              f->lscale, f->padx, f->pady);
                 f->in_args[0].ptr  = f->input.data();
                 f->in_args[0].size = f->input.size();
                 for (size_t k = 0; k < n_out; ++k) {
@@ -738,7 +753,6 @@ int main(int argc, char** argv) {
     // ---- drawer thread: per-stream reorder + draw + push to per-stream write_q + snapshot ----
     std::thread drawer([&]() {
         FramePtr f;
-        std::vector<Detection> dets;
         while (done_q.pop(f)) {
             int sid = f->stream_id;
             Stream* s = streams[sid].get();
@@ -751,30 +765,20 @@ int main(int argc, char** argv) {
                 ++s->next_idx;
 
                 // Default is clean stream pass-through; only the global HUD on
-                // the composite remains. Opt-in to per-stream colour-coded boxes
-                // with --boxes-only.
+                // the composite remains. Opt-in to per-stream annotation (boxes
+                // for detection, mask overlay for segmentation, etc.) with
+                // --boxes-only. The flag is task-agnostic — each task decides
+                // what "annotated" means.
                 if (boxes_only && bench < 2) {
                     std::vector<const int8_t*> ptrs(cur->outputs.size());
                     for (size_t k = 0; k < cur->outputs.size(); ++k) ptrs[k] = cur->outputs[k].data();
-                    dets.clear();
-                    yvm::decode_dfl_sigmoid_filter(ptrs, out_infos, out_tbl,
-                                                   conf_thresh, cur->lscale, cur->padx, cur->pady,
-                                                   cur->sw, cur->sh, dets);
-                    auto kept = yvm::nms(std::move(dets), iou_thresh);
-
-                    if (bench == 0) {
-                        // Boxes only — class label and confidence used to be drawn
-                        // as a small chip at the top-left corner of each box, but
-                        // those text bubbles clutter the view at small cell sizes.
-                        // Box colour already encodes the class (see class_color).
+                    auto result = task->postproc(ptrs, out_infos,
+                                                 conf_thresh, iou_thresh,
+                                                 cur->lscale, cur->padx, cur->pady,
+                                                 cur->sw, cur->sh);
+                    if (bench == 0 && result) {
                         Image im{cur->bgr.data(), cur->sw, cur->sh};
-                        for (const auto& d : kept) {
-                            uint8_t bc, gc, rc;
-                            yvm::class_color(d.cls, bc, gc, rc);
-                            int x1 = (int)d.x1, y1 = (int)d.y1,
-                                x2 = (int)d.x2, y2 = (int)d.y2;
-                            yvm::draw_rect(im, x1, y1, x2, y2, bc, gc, rc, 2);
-                        }
+                        task->draw(im, *result, font14);
                     }
                 }
 
