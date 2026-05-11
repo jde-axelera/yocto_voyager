@@ -470,18 +470,42 @@ int main(int argc, char** argv) {
     std::vector<WorkerBufs> wb(N);
     alloc_worker_bufs(wb, in_size, out_sizes);
 
+    // Side-car output dma-bufs (only used in --py-dispatch mode). The runtime's
+    // explore-latency sweep shows dblbuf+odmabuf=1 hits the highest system fps,
+    // and Python handles the odmabuf=1 path cleanly. C++ allocates the buffers
+    // (page-aligned, matching the Python DmaBufAllocator) and hands the fds to
+    // the worker over SCM_RIGHTS.
+    std::vector<int> sidecar_out_fds;
+    if (py_dispatch) {
+        const size_t pg = (size_t)sysconf(_SC_PAGE_SIZE);
+        auto page_align = [&](size_t n) { return ((n + pg - 1) / pg) * pg; };
+        int heap_fd = ::open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+        if (heap_fd < 0) { std::perror("py-dispatch: open dma_heap"); return 1; }
+        sidecar_out_fds.reserve(n_out);
+        for (size_t k = 0; k < n_out; ++k) {
+            dma_heap_allocation_data a{};
+            a.len      = page_align(out_sizes[k]);
+            a.fd_flags = O_RDWR | O_CLOEXEC;
+            if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0) {
+                std::perror("py-dispatch: dma alloc"); return 1;
+            }
+            sidecar_out_fds.push_back((int)a.fd);
+        }
+        ::close(heap_fd);
+    }
+
     // Start the Python side-car (after dma-bufs are allocated, so we can pass
-    // the input fd over SCM_RIGHTS). It loads the model + claims the AIPU.
+    // the fds over SCM_RIGHTS). It loads the model + claims the AIPU.
     yvm::PyAipuClient py_cli;
     if (py_dispatch) {
         std::fprintf(stderr, "[py-dispatch] starting %s ...\n", py_worker_path.c_str());
         if (!py_cli.start(py_worker_path, model_path, batch, batch,
-                          (int)n_out, /*output_dmabuf=*/false,
-                          wb[0].in_fd, {})) {
+                          (int)n_out, /*output_dmabuf=*/true,
+                          wb[0].in_fd, sidecar_out_fds)) {
             std::fprintf(stderr, "[py-dispatch] worker setup failed\n");
             return 1;
         }
-        std::fprintf(stderr, "[py-dispatch] worker ready\n");
+        std::fprintf(stderr, "[py-dispatch] worker ready (output_dmabuf=1)\n");
     }
 
     std::atomic<int64_t> infer_ns_total{0};
@@ -932,6 +956,7 @@ int main(int argc, char** argv) {
         if (disp_consumer.joinable()) disp_consumer.join();
     }
     free_worker_bufs(wb, in_size);
+    for (int fd : sidecar_out_fds) if (fd >= 0) ::close(fd);
     axr_destroy(AXR_OBJECT(ctx));
     return 0;
 }
