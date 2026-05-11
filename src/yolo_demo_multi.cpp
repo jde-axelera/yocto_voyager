@@ -52,6 +52,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <getopt.h>
 #include <linux/types.h>
 #include <map>
 #include <memory>
@@ -145,6 +146,35 @@ void free_worker_bufs(std::vector<WorkerBufs>& wb, size_t in_size) {
     }
 }
 
+void print_usage(const char* prog) {
+    std::fprintf(stderr,
+        "Usage: %s --model PATH --inputs CSV --out PREFIX [options]\n\n"
+        "Required:\n"
+        "  -m, --model PATH         path to model.json or .axm\n"
+        "  -i, --inputs CSV         1..10 comma-separated input mp4 paths\n"
+        "  -o, --out PREFIX         output mp4 path prefix (writes <PREFIX>_0.mp4 ...)\n\n"
+        "Tuning:\n"
+        "      --conf FLOAT         detection confidence threshold (default 0.25)\n"
+        "      --iou FLOAT          NMS IoU threshold (default 0.45)\n"
+        "      --fps N              per-stream target fps for ffmpeg -re -r N (default 25)\n"
+        "      --preproc N          preprocess thread count (default 4)\n\n"
+        "Display / output:\n"
+        "  -d, --display MODE       0=file only (default)\n"
+        "                           1=local X11 composite (DISPLAY=:0)\n"
+        "                           2=TCP MPEG-TS H.264 composite on port 5000\n\n"
+        "Diagnostic / advanced:\n"
+        "  -b, --bench MODE         0=full pipeline (default)\n"
+        "                           1=skip draw + write (postproc kept)\n"
+        "                           2=preproc + infer only (no postproc)\n"
+        "  -w, --workers N          inference instances (default 1; only meaningful\n"
+        "                           with a batch=1 model, ignored for batch=4 deploys)\n\n"
+        "  -h, --help               show this help and exit\n\n"
+        "Examples:\n"
+        "  %s -m model.json -i clip.mp4 -o /tmp/out\n"
+        "  %s -m model.json -i v1.mp4,v2.mp4,v3.mp4,v4.mp4 -o /tmp/s --display 2 --fps 25\n",
+        prog, prog, prog);
+}
+
 }  // namespace
 
 
@@ -155,27 +185,68 @@ int main(int argc, char** argv) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    if (argc < 4) {
-        std::fprintf(stderr,
-            "Usage: %s <model.json|.axm> <vid1.mp4[,vid2.mp4,...]> <output_prefix> "
-            "[conf=0.25] [iou=0.45] [workers=1] [bench=0] [dmabuf=0] "
-            "[preproc=4] [display=0] [fps=25]\n",
-            argv[0]);
-        return 1;
-    }
+    // ---- parse argv with getopt_long ----
+    std::string model_path, in_arg, out_prefix;
+    float  conf_thresh     = 0.25f;
+    float  iou_thresh      = 0.45f;
+    int    N               = 1;
+    int    bench           = 0;
+    int    preproc_threads = 4;
+    int    live_display    = 0;
+    int    target_fps      = 25;
 
-    // ---- parse argv ----
-    const char* model_path = argv[1];
-    std::string in_arg     = argv[2];
-    std::string out_prefix = argv[3];
-    float  conf_thresh     = (argc > 4)  ? std::atof(argv[4])  : 0.25f;
-    float  iou_thresh      = (argc > 5)  ? std::atof(argv[5])  : 0.45f;
-    int    N               = (argc > 6)  ? std::atoi(argv[6])  : 1;          if (N < 1) N = 1;
-    int    bench           = (argc > 7)  ? std::atoi(argv[7])  : 0;
-    int    /*use_dmabuf*/  _du = (argc > 8) ? std::atoi(argv[8]) : 0;  (void)_du;
-    int    preproc_threads = (argc > 9)  ? std::atoi(argv[9])  : 4;          if (preproc_threads < 1) preproc_threads = 1;
-    int    live_display    = (argc > 10) ? std::atoi(argv[10]) : 0;
-    int    target_fps      = (argc > 11) ? std::atoi(argv[11]) : 25;         if (target_fps < 1) target_fps = 25;
+    enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC };
+    static const struct option long_opts[] = {
+        {"model",   required_argument, nullptr, 'm'},
+        {"inputs",  required_argument, nullptr, 'i'},
+        {"out",     required_argument, nullptr, 'o'},
+        {"conf",    required_argument, nullptr, OPT_CONF},
+        {"iou",     required_argument, nullptr, OPT_IOU},
+        {"fps",     required_argument, nullptr, OPT_FPS},
+        {"preproc", required_argument, nullptr, OPT_PREPROC},
+        {"display", required_argument, nullptr, 'd'},
+        {"bench",   required_argument, nullptr, 'b'},
+        {"workers", required_argument, nullptr, 'w'},
+        {"help",    no_argument,       nullptr, 'h'},
+        {nullptr,   0,                 nullptr, 0  }
+    };
+    int opt;
+    while ((opt = getopt_long(argc, argv, "m:i:o:d:b:w:h", long_opts, nullptr)) != -1) {
+        switch (opt) {
+            case 'm':         model_path      = optarg;                break;
+            case 'i':         in_arg          = optarg;                break;
+            case 'o':         out_prefix      = optarg;                break;
+            case OPT_CONF:    conf_thresh     = std::atof(optarg);     break;
+            case OPT_IOU:     iou_thresh      = std::atof(optarg);     break;
+            case OPT_FPS:     target_fps      = std::atoi(optarg);     break;
+            case OPT_PREPROC: preproc_threads = std::atoi(optarg);     break;
+            case 'd':         live_display    = std::atoi(optarg);     break;
+            case 'b':         bench           = std::atoi(optarg);     break;
+            case 'w':         N               = std::atoi(optarg);     break;
+            case 'h':         print_usage(argv[0]); return 0;
+            default:          print_usage(argv[0]); return 2;
+        }
+    }
+    if (optind != argc) {
+        std::fprintf(stderr, "ERROR: unexpected positional argument '%s'\n\n", argv[optind]);
+        print_usage(argv[0]);
+        return 2;
+    }
+    if (model_path.empty() || in_arg.empty() || out_prefix.empty()) {
+        std::fprintf(stderr, "ERROR: --model, --inputs, --out are all required\n\n");
+        print_usage(argv[0]);
+        return 2;
+    }
+    if (N < 1) N = 1;
+    if (preproc_threads < 1) preproc_threads = 1;
+    if (target_fps < 1) target_fps = 25;
+    if (N != 1) {
+        std::fprintf(stderr,
+            "WARNING: --workers %d set; a batch=4 model uses all sub-devices in one\n"
+            "         call and cannot benefit from multiple instances. Keep --workers 1\n"
+            "         unless you have a batch=1 deploy.\n", N);
+    }
+    const char* model_path_c = model_path.c_str();
 
     // ---- TTF atlases ----
     FontAtlas* font14 = yvm::build_atlas(14.0f);
@@ -213,7 +284,7 @@ int main(int argc, char** argv) {
     axrContext* ctx = axr_create_context();
     if (!ctx) { std::fprintf(stderr, "axr_create_context failed\n"); return 1; }
 
-    axrModel* model = axr_load_model(ctx, model_path);
+    axrModel* model = axr_load_model(ctx, model_path_c);
     if (!model) {
         std::fprintf(stderr, "load_model: %s\n", axr_last_error_string(AXR_OBJECT(ctx)));
         return 1;
@@ -276,7 +347,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
         "model    : %s\n"
         "streams  : %zu  (%dx%d, %d fps each, aggregate %.0f fps)\n",
-        model_path, streams.size(), common_sw, common_sh, target_fps,
+        model_path_c, streams.size(), common_sw, common_sh, target_fps,
         streams.size() * (double)target_fps);
     for (auto& s : streams)
         std::fprintf(stderr, "  [%d] %s -> %s\n", s->id, s->in_path.c_str(), s->out_path.c_str());

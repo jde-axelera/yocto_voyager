@@ -125,10 +125,10 @@ cd ~/cpp_test
 
 # Single-stream example: 60 fps, file output only.
 sh 05_run.sh ./yolo_demo_multi \
-    ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
-    ~/some_video.mp4 \
-    ~/cpp_test/multi_out/single \
-    0.25 0.45 1 0 0 4 0 60
+    --model   ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
+    --inputs  ~/some_video.mp4 \
+    --out     ~/cpp_test/multi_out/single \
+    --fps     60
 ```
 
 For 10 streams at 25 fps each, with composite TCP H.264 display on port 5000:
@@ -138,11 +138,14 @@ VIDEO=~/some_video.mp4
 INPUTS=$(python3 -c "print(','.join(['$VIDEO']*10))")
 
 sh 05_run.sh ./yolo_demo_multi \
-    ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
-    "$INPUTS" \
-    ~/cpp_test/multi_out/s \
-    0.25 0.45 1 0 0 4 2 25
+    --model   ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
+    --inputs  "$INPUTS" \
+    --out     ~/cpp_test/multi_out/s \
+    --fps     25 \
+    --display 2
 ```
+
+(Run `./yolo_demo_multi --help` for the full flag reference.)
 
 The run prints a `[stats]` line every 2 s with per-stream and aggregate FPS. Stop with **Ctrl-C** — every output MP4 closes cleanly with a valid `moov` atom.
 
@@ -165,24 +168,24 @@ ffplay -fflags nobuffer -flags low_delay -probesize 100k tcp://localhost:5050
 ## CLI reference
 
 ```
-./yolo_demo_multi <model.json|.axm> <vid1.mp4[,vid2.mp4,...]> <output_prefix>
-                  [conf=0.25] [iou=0.45] [workers=1] [bench=0]
-                  [dmabuf=0] [preproc=4] [display=0] [fps=25]
+./yolo_demo_multi --model PATH --inputs CSV --out PREFIX [options]
 ```
 
-| Arg | Meaning |
-|---|---|
-| `model.json` / `.axm` | the path produced by `03_deploy_model.sh` |
-| `vid1.mp4,vid2.mp4,...` | 1–10 input videos (must all share resolution) |
-| `output_prefix` | output mp4 path; for N streams becomes `<prefix>_0.mp4 ... <prefix>_N-1.mp4` |
-| `conf` | detection confidence threshold |
-| `iou` | NMS IoU threshold |
-| `workers` | inference instances; keep at 1 for the batch=4 model |
-| `bench` | `0` full pipeline, `1` skip draw+write (postproc kept), `2` skip postproc/draw/write |
-| `dmabuf` | accepted but ignored — the binary always uses a worker-owned dma-heap input dmabuf |
-| `preproc` | preprocess thread count (default 4) |
-| `display` | `0` file only, `1` local X11 composite, `2` TCP MPEG-TS composite on port 5000 |
-| `fps` | per-stream target FPS for `ffmpeg -re -r N` pacing (default 25) |
+| Flag | Default | Meaning |
+|---|---|---|
+| `-m, --model PATH` | *required* | path to `model.json` or `.axm` (from `03_deploy_model.sh`) |
+| `-i, --inputs CSV` | *required* | 1–10 comma-separated input mp4 paths (must share resolution) |
+| `-o, --out PREFIX` | *required* | output mp4 path prefix → writes `<PREFIX>_0.mp4 ... <PREFIX>_N-1.mp4` |
+| `--conf FLOAT` | `0.25` | detection confidence threshold |
+| `--iou FLOAT` | `0.45` | NMS IoU threshold |
+| `--fps N` | `25` | per-stream target FPS for `ffmpeg -re -r N` pacing |
+| `--preproc N` | `4` | preprocess thread count |
+| `-d, --display MODE` | `0` | `0`=file only, `1`=local X11 composite, `2`=TCP MPEG-TS composite on port 5000 |
+| `-b, --bench MODE` | `0` | `0`=full pipeline, `1`=skip draw+write, `2`=preproc+infer only |
+| `-w, --workers N` | `1` | inference instances; only meaningful for batch=1 deploys (warning is printed if `>1`) |
+| `-h, --help` |  | print the full flag reference and exit |
+
+The CLI is fully named — order of flags does not matter, and flags can be specified in either long (`--model PATH`) or short (`-m PATH`) form.
 
 ---
 
