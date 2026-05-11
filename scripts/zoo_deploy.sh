@@ -110,25 +110,31 @@ deploy_exit=$?
 set -e
 
 BUILD="$SDK_DIR/build/$STEM/$STEM"
-if [ ! -f "$BUILD/$CORES/model.json" ]; then
-    echo "[deploy] FAIL: $BUILD/$CORES/model.json missing (deploy_exit=$deploy_exit)"
+# Pick whichever batch directory the compiler actually produced. Tiny models
+# (mobilenet, squeezenet) often only compile at batch=1 even when the YAML
+# requested aipu_cores=4 — falling back is fine, we just bench what we get.
+ACTUAL_CORES=""
+for c in "$CORES" 4 2 1; do
+    if [ -f "$BUILD/$c/model.json" ]; then ACTUAL_CORES="$c"; break; fi
+done
+if [ -z "$ACTUAL_CORES" ]; then
+    echo "[deploy] FAIL: no model.json found under $BUILD/{4,2,1}/ (deploy_exit=$deploy_exit)"
     rm -rf "$SDK_DIR/build/$STEM"
-    # Restore YAML.
     if [ -f "$YAML.bak" ]; then mv "$YAML.bak" "$YAML"; fi
     exit 1
 fi
+echo "[deploy] picked batch=$ACTUAL_CORES (requested $CORES)"
 
 # 3) Tar only the model.json + ELFs + manifest. Drop quantized debug/tmp.
-TAR_DIR="$SDK_DIR/build/$STEM/$STEM"
 TAR_OUT="$OUT_DIR/$STEM.tar.gz"
-echo "[deploy] tarring $TAR_DIR/$CORES → $TAR_OUT"
+echo "[deploy] tarring $BUILD/$ACTUAL_CORES → $TAR_OUT"
 tar czf "$TAR_OUT" \
     -C "$SDK_DIR/build/$STEM" \
-    "$STEM/$CORES/model.json" \
-    "$STEM/$CORES/manifest.json" \
+    "$STEM/$ACTUAL_CORES/model.json" \
+    "$STEM/$ACTUAL_CORES/manifest.json" \
     "$STEM/compile_config.json" \
     "$STEM/model_info.json" \
-    $(cd "$SDK_DIR/build/$STEM" && find "$STEM/$CORES" -maxdepth 1 -name "*.elf" -print 2>/dev/null) \
+    $(cd "$SDK_DIR/build/$STEM" && find "$STEM/$ACTUAL_CORES" -maxdepth 1 -name "*.elf" -print 2>/dev/null) \
     2>/dev/null || true
 
 # 4) Wipe the intermediate.
