@@ -105,6 +105,37 @@ struct WorkerBufs {
     std::vector<std::vector<int8_t>> out_heap;
 };
 
+// Sample system-wide CPU% by diffing /proc/stat between two sample() calls.
+// First call returns 0.0 (no baseline); subsequent calls return the percentage
+// of non-idle CPU time over the interval since the previous sample.
+class CpuMeter {
+    uint64_t last_idle_ = 0, last_total_ = 0;
+    bool     primed_ = false;
+public:
+    double sample() {
+        FILE* fp = std::fopen("/proc/stat", "r");
+        if (!fp) return 0.0;
+        char tag[8];
+        uint64_t user=0,nice=0,sys=0,idle=0,iow=0,irq=0,sirq=0,steal=0;
+        int n = std::fscanf(fp, "%7s %lu %lu %lu %lu %lu %lu %lu %lu",
+                            tag, &user, &nice, &sys, &idle, &iow, &irq, &sirq, &steal);
+        std::fclose(fp);
+        if (n < 5) return 0.0;
+        uint64_t idle_all = idle + iow;
+        uint64_t total    = user + nice + sys + idle + iow + irq + sirq + steal;
+        double pct = 0.0;
+        if (primed_) {
+            uint64_t dt = total    - last_total_;
+            uint64_t di = idle_all - last_idle_;
+            if (dt > 0) pct = 100.0 * (double)(dt - di) / (double)dt;
+        }
+        last_idle_  = idle_all;
+        last_total_ = total;
+        primed_     = true;
+        return pct;
+    }
+};
+
 // dma_heap_allocation_data + DMA_HEAP_IOCTL_ALLOC ABI copy (the same constants
 // dma_heap.cpp uses internally). We only need them here to allocate the
 // worker's per-instance batch input dmabuf.
@@ -573,19 +604,6 @@ int main(int argc, char** argv) {
                                 yvm::draw_text_ttf(im.data, im.w, im.h, x1 + ph, ly0 + pv,
                                                    label, 255, 255, 255, *font14);
                         }
-                        char hud[160];
-                        double total_s = std::max(1e-6,
-                            std::chrono::duration<double>(clk::now() - t0).count());
-                        double sfps = s->drawn.load(std::memory_order_relaxed) / total_s;
-                        std::snprintf(hud, sizeof hud, "stream %d  %.1f fps  dets %zu",
-                                      sid, sfps, kept.size());
-                        int htw = font18 ? yvm::text_width(*font18, hud) : (int)std::strlen(hud) * 8;
-                        int hth = font18 ? font18->line_height : 12;
-                        yvm::fill_rect_alpha(im.data, im.w, im.h,
-                                             8, 8, 8 + htw + 12, 8 + hth + 4, 0, 0, 0, 170);
-                        if (font18)
-                            yvm::draw_text_shadow(im.data, im.w, im.h, 14, 9, hud,
-                                                  255, 255, 255, *font18);
                     }
                 }
 
@@ -655,6 +673,16 @@ int main(int argc, char** argv) {
             std::vector<std::vector<uint8_t>> snaps(streams.size());
             for (auto& sn : snaps) sn.assign((size_t)common_sw * common_sh * 3, 0);
 
+            // Overall HUD state: sample once per second so the readout is steady
+            // (we still redraw the last sampled values onto every composite frame).
+            CpuMeter cpu;
+            auto hud_t_prev = clk2::now();
+            int  hud_last_inf = frames_inferred.load(std::memory_order_relaxed);
+            std::vector<int> hud_last_drawn(streams.size(), 0);
+            for (size_t i = 0; i < streams.size(); ++i)
+                hud_last_drawn[i] = streams[i]->drawn.load(std::memory_order_relaxed);
+            double hud_e2e_fps = 0.0, hud_inf_fps = 0.0, hud_cpu_pct = 0.0;
+
             while (!disp_stop.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_until(next);
                 next += period;
@@ -679,6 +707,37 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+
+                // Refresh HUD numbers once per second.
+                auto now = clk2::now();
+                double dt = std::chrono::duration<double>(now - hud_t_prev).count();
+                if (dt >= 1.0) {
+                    int inf_now = frames_inferred.load(std::memory_order_relaxed);
+                    hud_inf_fps = (inf_now - hud_last_inf) / dt;
+                    hud_last_inf = inf_now;
+                    double agg = 0.0;
+                    for (size_t i = 0; i < streams.size(); ++i) {
+                        int dn = streams[i]->drawn.load(std::memory_order_relaxed);
+                        agg += (dn - hud_last_drawn[i]) / dt;
+                        hud_last_drawn[i] = dn;
+                    }
+                    hud_e2e_fps = agg;
+                    hud_cpu_pct = cpu.sample();
+                    hud_t_prev  = now;
+                }
+
+                char hud[160];
+                std::snprintf(hud, sizeof hud,
+                              "E2E %.0f fps  |  Infer %.0f fps  |  CPU %.0f%%",
+                              hud_e2e_fps, hud_inf_fps, hud_cpu_pct);
+                int htw = font18 ? yvm::text_width(*font18, hud) : (int)std::strlen(hud) * 9;
+                int hth = font18 ? font18->line_height : 14;
+                yvm::fill_rect_alpha(composite.data(), comp_w, comp_h,
+                                     8, 8, 8 + htw + 16, 8 + hth + 6, 0, 0, 0, 180);
+                if (font18)
+                    yvm::draw_text_shadow(composite.data(), comp_w, comp_h, 16, 10, hud,
+                                          255, 255, 255, *font18);
+
                 disp_slot.push(std::vector<uint8_t>(composite));
             }
         });
