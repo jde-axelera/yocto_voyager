@@ -270,12 +270,41 @@ All measured on the same Antelao SoM, with the same 4-core `.axm` deploy.
 |---|---|---|---|
 | Pure AIPU device (`axrunmodel` `--explore-latency`, best config) | **~870** | 1.15 ms / frame | silicon ceiling |
 | GStreamer + `axinferencenet` plugin (x86_64 host, marketing figure) | ~750 | ~1.3 ms | VAAPI dmabuf in, SDK plugin out |
-| `axrunmodel` Python harness (best config: `dblbuf, odmabuf=0`) | **446 host / 390 system** | 4.7 / 9.0 ms | the reference C++ ceiling, via the runtime |
-| **This repo — single stream, file output** | **~246** | 3.2 ms / batch-frame | what `yolo_demo_multi` gets |
+| `axrunmodel` Python harness (`dblbuf, odmabuf=1` on this SBC) | **574 host / 543 system** | 1.7 / 7.4 ms | the runtime-pipeline ceiling, measured locally |
+| **This repo — `--py-dispatch --bench 2 --unpaced` (10 streams)** | **~380 aggregate** | 2.6 ms / batch-frame | side-car routes the AIPU call through `axelera.runtime`; 70 % of axrunmodel ceiling |
+| **This repo — single stream, file output, public C API** | **~246** | 3.2 ms / batch-frame | what `yolo_demo_multi` gets without `--py-dispatch` |
 | **This repo — 10 streams × 25 fps target** | **~218 aggregate (~22 per stream)** | 3.6 ms / batch-frame | 89 % of single-stream, all 10 mp4s clean |
 | `axelera.runtime.op.seq()` (Python "Pythonic API") | **~13** | 78 ms | synchronous frame loop in Python; not for throughput |
 
-### Why `axrunmodel` is faster than this C++ binary (~446 vs ~246)
+### Closing the gap to `axrunmodel` with `--py-dispatch`
+
+`tools/aipu_worker.py` is a persistent Python side-car launched by `--py-dispatch`. The orchestrator passes it the input + output dma-buf fds over `SCM_RIGHTS`, then signals one byte per batch to trigger `instance.run`. The runtime's internal pipeline (`prefill=2, drop=2` per axrunmodel) overlaps the next batch's input upload with the current batch's execute, which is what `axr_run_model_instance` *can't* do from C++ alone:
+
+```text
+                      (C++ worker thread)               (Python side-car)
+   preproc → inst_q ──► memcpy into in-dmabuf ──► socket "G" ─────► instance.run([in_fd], [out_fds])
+                                                  socket "D" ◄─────┘  (AIPU writes into out-dmabufs)
+                                                                      (C++ never copies out — heap discard)
+```
+
+Caveats:
+
+- `--py-dispatch` currently requires `--bench 2` (preproc + infer, no postproc/draw/write); the AIPU outputs land in C++-owned dma-bufs but aren't yet ferried back into per-frame heap copies in this mode. The flag is for benchmarking the dispatch ceiling.
+- The C++ skips `axr_device_connect` / `axr_load_model_instance` (Python owns the device) but keeps `axr_load_model` for tensor-info introspection.
+- One persistent Python process per binary, ~80 MB resident.
+
+To reproduce:
+
+```sh
+source ~/axelera_pip/axelera-env/bin/activate
+cd ~/cpp_test
+./run.sh ./yolo_demo_multi -m /path/to/model.json \
+    -i traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4 \
+    -o /tmp/probe --unpaced --bench 2 --display 0 \
+    --py-dispatch --py-worker /home/antelao/cpp_test/aipu_worker.py
+```
+
+### Why the public C API alone caps at ~246 fps
 
 Two reasons, both about *concurrency on a single model instance*:
 
@@ -303,7 +332,7 @@ The plugin is shipped only as part of the full Voyager SDK install (the `install
 - The pip `axelera-devkit` package (which would pull in everything) **fails to install** on this image: its transitive dependency `onnxoptimizer` has no aarch64 wheel and Voyager Linux ships no C++ host compiler to build it from source.
 - The Voyager Linux image was built for runtime, not development (no `dev-pkgs`, no `tools-sdk`).
 
-So on this image, **`~246 fps` is the practical ceiling reachable through the public C API**. Closing the gap to `axrunmodel`'s ~446 fps or GStreamer's ~750 fps would require either getting the dev-kit working (which a development-flavour Yocto image would allow) or moving the workload to an x86 host with the full SDK installed.
+So on this image, **`~246 fps` is the practical ceiling reachable through the public C API**. The `--py-dispatch` mode lifts that to ~380 fps by routing the dispatch through `axelera.runtime` (still within this binary, via the Python side-car). Reaching `axinferencenet`'s ~750 fps would still require either the full Voyager SDK install or a development-flavour Yocto image with the dev-kit.
 
 ### Why `display=2` costs FPS only when a viewer is connected
 
