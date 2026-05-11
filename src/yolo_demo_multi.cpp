@@ -600,7 +600,8 @@ int main(int argc, char** argv) {
                     out_args.data(), out_args.size());
                 auto t_b = clk::now();
                 if (r != AXR_SUCCESS) {
-                    std::fprintf(stderr, "[worker %d] run failed: %s\n", i,
+                    std::fprintf(stderr, "[worker %d] run failed: code=%d (%s) msg=%s\n",
+                        i, (int)r, axr_error_string(r),
                         axr_last_error_string(AXR_OBJECT(ctx)));
                     return;
                 }
