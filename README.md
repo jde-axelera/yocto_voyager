@@ -12,7 +12,7 @@ The composite display grid is auto-sized from the stream count: `cols = ⌈√N�
 
 ## What you get
 
-- `src/yolo_demo_multi.cpp` — the only C++ source, ~1300 lines. Everything from earlier experiments has been removed and the surviving optimizations consolidated here.
+- `src/yolo_demo_multi.cpp` plus a handful of focused modules under `src/` — the C++ source, ~2500 lines total (not counting baked data: COCO names, palette, Liberation Sans Bold TTF, stb_truetype). Each module owns one piece of the pipeline (preproc, postproc, dma-heap pool, drawing, TTF font, subprocess wiring, optional Python side-car client).
 - `scripts/01_update_driver.sh` ... `05_run.sh` — five short shell scripts that take you from a fresh SBC to a running demo.
 - `src/CMakeLists.txt` + `toolchain-aarch64.cmake` — cross-build setup for any x86_64 Linux build host.
 - This README, plus reproducible per-step notes and the full FPS/latency analysis below.
@@ -208,6 +208,9 @@ ffplay -fflags nobuffer -flags low_delay -probesize 100k tcp://localhost:5050
 | `--fps N` | `25` | per-stream target FPS. For files: `ffmpeg -re -r N` pacing. For `usb:<N>`: device capture framerate. |
 | `--usb-size WxH` | `640x480` | capture resolution for any `usb:<N>` entry (UVC MJPEG). If you mix with a file, set this to match the file's resolution. |
 | `--preproc N` | `4` | preprocess thread count |
+| `--unpaced` | off | drop ffmpeg `-re` on file inputs so frames decode as fast as possible (benchmark mode; ignored for `usb:<N>`) |
+| `--py-dispatch` | off | route the AIPU call through `tools/aipu_worker.py` — recovers the runtime's internal pipeline. Currently requires `--bench 2` and `--workers 1`. See [`--py-dispatch`](#closing-the-gap-to-axrunmodel-with---py-dispatch) below. |
+| `--py-worker PATH` | `tools/aipu_worker.py` | path to the Python side-car script (used only with `--py-dispatch`) |
 | `-d, --display MODE` | `0` | `0`=file only, `1`=local X11 composite, `2`=TCP MPEG-TS composite on port 5000 |
 | `-b, --bench MODE` | `0` | `0`=full pipeline, `1`=skip draw+write, `2`=preproc+infer only |
 | `-w, --workers N` | `1` | inference instances; only meaningful for batch=1 deploys (warning is printed if `>1`) |
@@ -375,7 +378,7 @@ After a clean Ctrl-C the files have valid `moov` atoms and play immediately in `
 ├── toolchain-aarch64.cmake          # cross-toolchain file for CMake
 ├── src/
 │   ├── CMakeLists.txt
-│   ├── yolo_demo_multi.cpp          # ~570-line orchestrator (argv parsing + thread launch)
+│   ├── yolo_demo_multi.cpp          # ~960-line orchestrator (argv parsing + thread launch)
 │   │
 │   │   ── pipeline modules ──
 │   ├── concurrency.h                # BoundedQueue + LeakyOne (header-only templates)
@@ -386,12 +389,15 @@ After a clean Ctrl-C the files have valid `moov` atoms and play immediately in `
 │   ├── yolo_preproc.h / .cpp        # letterbox + quantize into model input layout
 │   ├── yolo_postproc.h / .cpp       # DFL + sigmoid + class-aware NMS
 │   ├── frame.h                      # Frame and Stream structs
+│   ├── py_aipu_client.h / .cpp      # client for the Python AIPU side-car (--py-dispatch)
 │   │
 │   │   ── data ──
 │   ├── coco_names.h                 # 80 COCO class names
 │   ├── coco_palette.h               # curated 80-class colour palette
 │   ├── liberation_sans_bold.h       # TTF baked as a C uint8 array
 │   └── stb/stb_truetype.h           # public-domain TTF rasteriser (single header)
+├── tools/
+│   └── aipu_worker.py               # persistent Python side-car invoked by --py-dispatch
 ├── scripts/
 │   ├── 01_update_driver.sh          # on SBC, as root: metis driver 1.4.4 -> 1.4.16
 │   ├── 02_install_runtime.sh        # on SBC: pip-install axelera-rt into a venv
