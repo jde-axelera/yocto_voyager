@@ -25,12 +25,14 @@ bool probe_video(const std::string& path, int& w, int& h, double& fps, int64_t& 
 
 /// Spawn ffmpeg as a paced raw-BGR reader.
 ///
-///   ffmpeg -stream_loop -1 -re -i <path> -r <target_fps> -f rawvideo -pix_fmt bgr24 -
+///   ffmpeg -stream_loop -1 [-re] -i <path> -r <target_fps> -f rawvideo -pix_fmt bgr24 -
 ///
 /// The looping input + `-re` pacing + `-r` re-clocking gives a steady output rate
-/// regardless of how fast we drain the pipe.
+/// regardless of how fast we drain the pipe. When `unpaced` is true, the `-re` flag
+/// is dropped so ffmpeg decodes the file as fast as possible (useful for benchmarks
+/// where you want to saturate the AIPU rather than match input fps).
 Subprocess ffmpeg_reader(const std::string& path, int& w, int& h, double& fps,
-                         int64_t& nframes, int target_fps);
+                         int64_t& nframes, int target_fps, bool unpaced = false);
 
 /// Spawn ffmpeg as a V4L2 USB-camera raw-BGR reader.
 ///

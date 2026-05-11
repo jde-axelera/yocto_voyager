@@ -194,6 +194,9 @@ void print_usage(const char* prog) {
         "      --usb-size WxH       USB-camera capture size (default 640x480). All streams\n"
         "                           must share dimensions, so if mixing with a file, set this\n"
         "                           to match the file's resolution.\n"
+        "      --unpaced            drop ffmpeg's -re flag on file inputs so frames are\n"
+        "                           decoded as fast as possible (benchmark mode). Ignored\n"
+        "                           for usb:<N> inputs which are always device-paced.\n"
         "      --preproc N          preprocess thread count (default 4)\n\n"
         "Display / output:\n"
         "  -d, --display MODE       0=file only (default)\n"
@@ -235,8 +238,9 @@ int main(int argc, char** argv) {
     int    target_fps      = 25;
     int    usb_w           = 640;
     int    usb_h           = 480;
+    bool   unpaced         = false;
 
-    enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE };
+    enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE, OPT_UNPACED };
     static const struct option long_opts[] = {
         {"model",    required_argument, nullptr, 'm'},
         {"inputs",   required_argument, nullptr, 'i'},
@@ -246,6 +250,7 @@ int main(int argc, char** argv) {
         {"fps",      required_argument, nullptr, OPT_FPS},
         {"preproc",  required_argument, nullptr, OPT_PREPROC},
         {"usb-size", required_argument, nullptr, OPT_USB_SIZE},
+        {"unpaced",  no_argument,       nullptr, OPT_UNPACED},
         {"display",  required_argument, nullptr, 'd'},
         {"bench",    required_argument, nullptr, 'b'},
         {"workers",  required_argument, nullptr, 'w'},
@@ -268,6 +273,7 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 break;
+            case OPT_UNPACED: unpaced       = true;                    break;
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
@@ -394,7 +400,8 @@ int main(int argc, char** argv) {
             s->reader  = yvm::ffmpeg_v4l2_reader(dev_path, usb_w, usb_h, target_fps);
         } else {
             int64_t nf = 0;
-            s->reader = yvm::ffmpeg_reader(s->in_path, s->sw, s->sh, s->fps_in, nf, target_fps);
+            s->reader = yvm::ffmpeg_reader(s->in_path, s->sw, s->sh, s->fps_in, nf,
+                                           target_fps, unpaced);
             s->nframes = nf;
         }
         if (common_sw == 0) { common_sw = s->sw; common_sh = s->sh; }

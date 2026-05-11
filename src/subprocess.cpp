@@ -37,7 +37,7 @@ bool probe_video(const std::string& path, int& w, int& h, double& fps, int64_t& 
 }
 
 Subprocess ffmpeg_reader(const std::string& path, int& w, int& h, double& fps,
-                         int64_t& nframes, int target_fps)
+                         int64_t& nframes, int target_fps, bool unpaced)
 {
     if (!probe_video(path, w, h, fps, nframes)) std::exit(1);
 
@@ -50,14 +50,19 @@ Subprocess ffmpeg_reader(const std::string& path, int& w, int& h, double& fps,
         ::close(pipefd[1]);
         char rate_arg[32];
         std::snprintf(rate_arg, sizeof rate_arg, "%d", target_fps);
-        execlp("ffmpeg",
-               "ffmpeg", "-loglevel", "error",
-               "-stream_loop", "-1",
-               "-re",                                  // pace input at native rate
-               "-i", path.c_str(),
-               "-r", rate_arg,                         // re-clock to target_fps
-               "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
-               (char*)nullptr);
+        // Build argv dynamically so we can omit -re when unpaced.
+        const char* argv[16]; int n = 0;
+        argv[n++] = "ffmpeg";
+        argv[n++] = "-loglevel"; argv[n++] = "error";
+        argv[n++] = "-stream_loop"; argv[n++] = "-1";
+        if (!unpaced) argv[n++] = "-re";                // pace input at native rate
+        argv[n++] = "-i"; argv[n++] = path.c_str();
+        if (!unpaced) { argv[n++] = "-r"; argv[n++] = rate_arg; }
+        argv[n++] = "-f"; argv[n++] = "rawvideo";
+        argv[n++] = "-pix_fmt"; argv[n++] = "bgr24";
+        argv[n++] = "-";
+        argv[n]   = nullptr;
+        execvp(argv[0], (char* const*)argv);
         _exit(127);
     }
     ::close(pipefd[1]);
