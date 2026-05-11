@@ -201,8 +201,9 @@ void print_usage(const char* prog) {
         "      --py-dispatch        route axr_run_model_instance through a persistent\n"
         "                           tools/aipu_worker.py side-car (recovers the runtime's\n"
         "                           internal pipeline; matches axrunmodel's ~425+ fps).\n"
-        "                           Currently requires --bench 2 (outputs are not crossed\n"
-        "                           back over the Python boundary yet) and --workers 1.\n"
+        "                           Output dma-bufs are mmap'd by C++ so postproc + draw +\n"
+        "                           MP4 write all still work (i.e. --bench 0 is supported).\n"
+        "                           Requires --workers 1.\n"
         "      --py-worker PATH     path to aipu_worker.py (default tools/aipu_worker.py)\n"
         "      --preproc N          preprocess thread count (default 4)\n\n"
         "Display / output:\n"
@@ -397,13 +398,7 @@ int main(int argc, char** argv) {
                 "ERROR: --py-dispatch only supports --workers 1\n");
             return 2;
         }
-        if (bench < 2) {
-            std::fprintf(stderr,
-                "ERROR: --py-dispatch currently requires --bench 2 (output\n"
-                "       tensors are not returned across the Python boundary yet).\n");
-            return 2;
-        }
-        props = "input_dmabuf=1;double_buffer=1 (via Python side-car)";
+        props = "input_dmabuf=1;output_dmabuf=1;double_buffer=1 (via Python side-car)";
     }
 
     yvm::PreprocCtx pre_ctx = yvm::make_preproc(in_infos[0]);
@@ -473,23 +468,33 @@ int main(int argc, char** argv) {
     // Side-car output dma-bufs (only used in --py-dispatch mode). The runtime's
     // explore-latency sweep shows dblbuf+odmabuf=1 hits the highest system fps,
     // and Python handles the odmabuf=1 path cleanly. C++ allocates the buffers
-    // (page-aligned, matching the Python DmaBufAllocator) and hands the fds to
-    // the worker over SCM_RIGHTS.
-    std::vector<int> sidecar_out_fds;
+    // (page-aligned, matching the Python DmaBufAllocator), hands the fds to the
+    // worker over SCM_RIGHTS, and keeps a CPU mmap so the worker thread can
+    // slice batch outputs into per-frame buffers after each ack.
+    std::vector<int>    sidecar_out_fds;
+    std::vector<void*>  sidecar_out_ptr;
+    std::vector<size_t> sidecar_out_alloc;  // page-aligned bytes (for munmap)
     if (py_dispatch) {
         const size_t pg = (size_t)sysconf(_SC_PAGE_SIZE);
         auto page_align = [&](size_t n) { return ((n + pg - 1) / pg) * pg; };
         int heap_fd = ::open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
         if (heap_fd < 0) { std::perror("py-dispatch: open dma_heap"); return 1; }
         sidecar_out_fds.reserve(n_out);
+        sidecar_out_ptr.reserve(n_out);
+        sidecar_out_alloc.reserve(n_out);
         for (size_t k = 0; k < n_out; ++k) {
+            size_t pa = page_align(out_sizes[k]);
             dma_heap_allocation_data a{};
-            a.len      = page_align(out_sizes[k]);
+            a.len      = pa;
             a.fd_flags = O_RDWR | O_CLOEXEC;
             if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0) {
                 std::perror("py-dispatch: dma alloc"); return 1;
             }
+            void* p = mmap(nullptr, pa, PROT_READ, MAP_SHARED, (int)a.fd, 0);
+            if (p == MAP_FAILED) { std::perror("py-dispatch: mmap out"); return 1; }
             sidecar_out_fds.push_back((int)a.fd);
+            sidecar_out_ptr.push_back(p);
+            sidecar_out_alloc.push_back(pa);
         }
         ::close(heap_fd);
     }
@@ -657,17 +662,29 @@ int main(int argc, char** argv) {
                     std::chrono::duration_cast<std::chrono::nanoseconds>(t_b - t_a).count(),
                     std::memory_order_relaxed);
 
+                // Outputs land in either:
+                //   - wb[i].out_heap[k]      (public C API path, runtime memcpys here)
+                //   - sidecar_out_ptr[k]     (py-dispatch path, AIPU DMAs here; invalidate caches)
+                if (py_dispatch) {
+                    for (size_t k = 0; k < n_out; ++k)
+                        InputBufferPool::sync_start_read(sidecar_out_fds[k]);
+                }
                 for (int b = 0; b < (int)batch_frames.size(); ++b) {
                     auto& f = batch_frames[b];
                     f->outputs.resize(n_out);
                     for (size_t k = 0; k < n_out; ++k) {
                         f->outputs[k].assign(out_slot[k], 0);
-                        std::memcpy(f->outputs[k].data(),
-                                    wb[i].out_heap[k].data() + b * out_slot[k],
-                                    out_slot[k]);
+                        const uint8_t* src = py_dispatch
+                            ? static_cast<const uint8_t*>(sidecar_out_ptr[k])
+                            : reinterpret_cast<const uint8_t*>(wb[i].out_heap[k].data());
+                        std::memcpy(f->outputs[k].data(), src + b * out_slot[k], out_slot[k]);
                     }
                     frames_inferred.fetch_add(1, std::memory_order_relaxed);
                     done_q.push(std::move(f));
+                }
+                if (py_dispatch) {
+                    for (size_t k = 0; k < n_out; ++k)
+                        InputBufferPool::sync_end_read(sidecar_out_fds[k]);
                 }
                 batch_frames.clear();
             };
@@ -956,7 +973,10 @@ int main(int argc, char** argv) {
         if (disp_consumer.joinable()) disp_consumer.join();
     }
     free_worker_bufs(wb, in_size);
-    for (int fd : sidecar_out_fds) if (fd >= 0) ::close(fd);
+    for (size_t k = 0; k < sidecar_out_fds.size(); ++k) {
+        if (sidecar_out_ptr[k]) munmap(sidecar_out_ptr[k], sidecar_out_alloc[k]);
+        if (sidecar_out_fds[k] >= 0) ::close(sidecar_out_fds[k]);
+    }
     axr_destroy(AXR_OBJECT(ctx));
     return 0;
 }
