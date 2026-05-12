@@ -37,6 +37,18 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$REPO_ROOT/deploys/$TASK"
 mkdir -p "$OUT_DIR"
 
+# Restore YAML on any exit so a script crash mid-deploy doesn't leave the
+# voyager-sdk YAML permanently patched (which causes the next manual run to
+# misbehave because compilation_config is already present).
+YAML_BAK_PATH=""
+restore_yaml() {
+    if [ -n "$YAML_BAK_PATH" ] && [ -f "$YAML_BAK_PATH" ]; then
+        local orig="${YAML_BAK_PATH%.bak}"
+        mv "$YAML_BAK_PATH" "$orig" 2>/dev/null || true
+    fi
+}
+trap restore_yaml EXIT
+
 # Locate the YAML (zoo trees vary by task subdir layout).
 YAML=""
 for c in \
@@ -62,6 +74,7 @@ echo "[deploy] task=$TASK stem=$STEM cores=$CORES"
 # 1) Patch YAML with compilation_config (idempotent).
 if ! grep -q "compilation_config:" "$YAML"; then
     cp "$YAML" "$YAML.bak"
+    YAML_BAK_PATH="$YAML.bak"
     python3 - "$YAML" "$CORES" <<'PY'
 import pathlib, re, sys
 yaml_path = pathlib.Path(sys.argv[1])
@@ -168,9 +181,8 @@ else
     echo "[deploy] WARN: tar did not produce $TAR_OUT"
 fi
 
-# 4) Wipe the intermediate.
+# 4) Wipe the intermediate. YAML restore happens via the EXIT trap.
 rm -rf "$SDK_DIR/build/$STEM"
-if [ -f "$YAML.bak" ]; then mv "$YAML.bak" "$YAML"; fi
 
 # 5) Report.
 SIZE=$(du -h "$TAR_OUT" | awk '{print $1}')
