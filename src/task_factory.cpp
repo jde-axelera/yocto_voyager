@@ -13,6 +13,7 @@
 
 #include "tasks/classify.h"
 #include "tasks/detection.h"
+#include "tasks/embed.h"
 #include "tasks/stubs.h"
 
 namespace yvm {
@@ -24,7 +25,7 @@ std::unique_ptr<TaskHandler> make_task(const std::string& name) {
     if (name == "seg")       return std::make_unique<StubTask>("seg");
     if (name == "obb")       return std::make_unique<StubTask>("obb");
     if (name == "face")      return std::make_unique<StubTask>("face");
-    if (name == "embed")     return std::make_unique<StubTask>("embed");
+    if (name == "embed")     return std::make_unique<EmbedTask>();
     return nullptr;
 }
 

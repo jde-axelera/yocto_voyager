@@ -26,6 +26,7 @@ add_library(yolo_voyager_core STATIC
     task_factory.cpp
     tasks/detection.cpp
     tasks/classify.cpp
+    tasks/embed.cpp
 )
 target_include_directories(yolo_voyager_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
