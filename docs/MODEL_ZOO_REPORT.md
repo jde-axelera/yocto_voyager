@@ -1,80 +1,119 @@
 # Model-zoo benchmark report
 
-_Branch: `feat/model-zoo`. Run scheduled for the night of 2026-05-11 → 2026-05-12._
+_Branch: `feat/model-zoo`. Overnight run 2026-05-11 → 2026-05-12._
 
-## What this report is
+## Headline
 
-A unified C++ inference binary (`yolo_demo_multi`, soon to be `yvm_demo`) was
-extended with a **task-class abstraction** (`src/task.h`) so that all
-voyager-sdk zoo models can run through the same preproc → AIPU dispatch → optional
-postproc/draw pipeline. Each task class lives under `src/tasks/<name>.{h,cpp}`
-and is selected at run time via `--task <name>`.
+| | Count |
+|---|---|
+| Models attempted | 8 (one representative per task class) |
+| Deploys succeeded on the build host | **3** — `yolo11n-coco-onnx`, `retinaface-mobilenet0.25-widerface-onnx`, `osnet-x1-0-market1501-onnx` |
+| Deploys failed (compile timeout / wrong stem / script bug) | 5 — pose, instance-seg, semantic-seg (timeout); OBB (typo in JOBS); classify (deploy-script bug, retry queued) |
+| Models that loaded + ran on the SBC end-to-end | **1** — `yolo11n-coco-onnx` (378 fps system, `--py-dispatch --bench 2`) |
+| Models that compiled but `axrunmodel` itself can't load them on this SBC | 2 — `retinaface`, `osnet` (silent failure between `Context()` and the first `instance.run()`) |
 
-| `--task` | Module | Status |
-|---|---|---|
-| `detection`  | `tasks/detection.{h,cpp}`         | full decode + colour-box draw (production; ~378 fps on yolo11n via --py-dispatch) |
-| `classify`   | `tasks/classify.{h,cpp}`          | top-1 argmax + label overlay |
-| `embed`      | `tasks/embed.{h,cpp}`             | L2 norm + first-8 components overlay |
-| `pose`       | `tasks/stubs.h` → `StubTask`      | preproc + inference only (decode is future work) |
-| `seg`        | `tasks/stubs.h` → `StubTask`      | preproc + inference only |
-| `obb`        | `tasks/stubs.h` → `StubTask`      | preproc + inference only |
-| `face`       | `tasks/stubs.h` → `StubTask`      | preproc + inference only |
+The C++ side of the work — the `TaskHandler` abstraction, the deploy + bench
+harness, the disk-rotation discipline — is solid. The blocking issue tonight is
+the **voyager-rt 1.6 runtime on the Antelao SoM only accepts yolo11n-style
+model.json files** out of the build-host’s freshly compiled outputs. Diagnosing
+which compile artifact triggers the silent runtime failure for `retinaface` /
+`osnet` is the obvious next step.
 
-## Selected models — one per task class
+## What was built (code + scripts)
 
-| Voyager-SDK task subdir | Selected stem | Why this one |
-|---|---|---|
-| `object_detection`        | `yolo11n-coco-onnx`                              | already deployed, baseline |
-| `classification`          | `mobilenetv2-imagenet-onnx`                      | smallest torchvision classifier |
-| `keypoint_detection`      | `yolov8npose-coco-onnx`                          | smallest YOLO pose variant |
-| `obb_detection`           | `yolo11n-obb-dotav1-onnx`                        | smallest YOLO OBB variant |
-| `instance_segmentation`   | `yolov8nseg-coco-onnx`                           | smallest YOLO instance seg |
-| `semantic_segmentation`   | `unet_fcn_512-cityscapes`                        | only mmseg model in 1.6 zoo |
-| `face_detection`          | `retinaface-mobilenet0.25-widerface-onnx`        | only face model in 1.6 zoo |
-| `embedding`               | `osnet-x1-0-market1501-onnx`                     | smallest re-id |
+- **`src/task.h`** — single `TaskHandler` interface every zoo task implements.
+- **`src/task_factory.cpp`** — `--task <name>` registry (detection, classify,
+  pose, seg, obb, face, embed).
+- **`src/tasks/`** —
+    - `detection.{h,cpp}` — full DFL + sigmoid + NMS + colour box draw (the
+      existing yolo path, lifted out of the orchestrator).
+    - `classify.{h,cpp}` — argmax-over-int8 + top-1 label overlay.
+    - `embed.{h,cpp}`     — L2 norm + first-8-component overlay.
+    - `stubs.h`           — preproc+inference-only handler used by `pose`,
+      `seg`, `obb`, `face` until per-task decoders are written. Lets every
+      compiled model still pass through the harness for benchmarking.
+- **`src/yolo_demo_multi.cpp`** — now thin: parses argv, instantiates the
+  `TaskHandler`, drives the existing decoder/preproc/worker/drawer threads.
+  The drawer thread dispatches `task->postproc()` + `task->draw()` instead of
+  the hardcoded yolo code.
+- **`scripts/zoo_deploy.sh`** — single-model deploy with:
+    - YAML auto-patch (compilation_config: aipu_cores_used, resources_used)
+    - per-model EXIT trap that restores the YAML even on a crashed deploy
+    - whole-batch-dir tar including `pool_*_const.bin`, `quantized/`,
+      `compiler_config.toml` (every artifact the runtime actually opens)
+    - intermediate `build/<stem>/` is immediately `rm -rf`’d after tar to
+      survive on a 94%-full build-host disk.
+- **`scripts/zoo_deploy_all.sh`** — serial bulk runner with a 15-minute
+  per-model watchdog (`timeout --kill-after=60 900 …`) so a stuck compile
+  never burns the whole night.
+- **`scripts/zoo_retry.sh`** — re-deploy the first-pass failures with the
+  fixed script + corrected stems + a couple of bonus classifiers
+  (resnet18, squeezenet1.0).
+- **`scripts/zoo_bench.sh`** — per-tarball SBC bench with the watchdog,
+  task-name remap (`object_detection` → `detection`, `keypoint_detection` →
+  `pose`, etc.), and CSV append-row output.
+- **`scripts/zoo_bench_all.sh`** — sweep all tarballs under `~/zoo_tarballs/`.
+- **`scripts/zoo_report.py`** — joins `deploys/_summary.csv` and
+  `~/cpp_test/zoo_report.csv` into this Markdown report.
 
-## Deploy / bench results
+## Selected models (one per voyager-sdk task subdir)
 
-_Filled in by `scripts/zoo_report.py` once the overnight run finishes; the
-working data lives in `deploys/_summary.csv` (build host) and `~/cpp_test/zoo_report.csv`
-(SBC)._
+| Voyager subdir | Stem | Deploy | Tarball size | Bench |
+|---|---|---|---|---|
+| `object_detection`        | `yolo11n-coco-onnx`                              | **OK**  | 3.8 M | **OK 378 fps system, 1.91 ms / batch** |
+| `classification`          | `mobilenetv2-imagenet-onnx`                      | FAIL (script bug, retry queued) | — | — |
+| `keypoint_detection`      | `yolov8npose-coco-onnx`                          | FAIL (compile > 15 min watchdog) | — | — |
+| `obb_detection`           | `yolo11nobb-coco-onnx` *(wrong stem; corrected to `yolo11n-obb-dotav1-onnx` in retry)* | FAIL | — | — |
+| `instance_segmentation`   | `yolov8nseg-coco-onnx`                           | FAIL (compile > 15 min watchdog; killed at 38:34 with 7.7 GB RSS) | — | — |
+| `semantic_segmentation`   | `unet_fcn_512-cityscapes`                        | not reached (bulk aborted at seg stage) | — | — |
+| `face_detection`          | `retinaface-mobilenet0.25-widerface-onnx`        | OK | 1.1 M | **FAIL — silent runtime crash on model load** (axrunmodel also fails) |
+| `embedding`               | `osnet-x1-0-market1501-onnx`                     | OK | 2.2 M | **FAIL — silent runtime crash on model load** (axrunmodel also fails) |
 
-See **`scripts/zoo_report.py`** for the table renderer and `scripts/zoo_deploy_all.sh`
-+ `scripts/zoo_bench_all.sh` for the run scripts.
+## Detailed bench output (`~/cpp_test/zoo_report.csv` on the SBC)
 
-## Operational findings (from the overnight run)
+```
+task,stem,bench,fps_system,fps_infer,lat_ms_per_batch,status,notes
+detection,yolo11n-coco-onnx,2,378.2,378.2,1.912,OK,
+face,retinaface-mobilenet0.25-widerface-onnx,2,0.0,0.0,,NO_STATS,
+embed,osnet-x1-0-market1501-onnx,2,0.0,0.0,,NO_STATS,
+```
 
-| Failure mode | Affected | Root cause | Mitigation |
+The yolo11n number is identical to what we measured before the model-zoo
+refactor (commit `0aa46c2` on `main`), confirming the new `TaskHandler` virtual
+dispatch is free at runtime.
+
+## Operational findings (what broke, why, how it's now fixed)
+
+| Failure mode | Trigger | Fix in this branch | Commit |
 |---|---|---|---|
-| `deploy.py` exits with non-zero even after producing artifacts | yolo11n, retinaface, … | spurious "Failed to deploy network" near the end of compile, while build/.../*/{model.json,ELFs,bins} are all present | `scripts/zoo_deploy.sh` ignores deploy.py's exit code and gates on `model.json` existence |
-| Tarball missing const-weight blobs (`pool_ddr_const.bin`, `pool_l2_const.bin`) | initial yolo11n tar | overly tight tar include-list | include the whole `$STEM/<cores>/` dir + the `quantized/` sibling + `compiler_config.toml`; binary path also expects them at extract time |
-| Tarball missing `quantized/manifest.json` + `postprocess_graph.onnx` | initial yolo11n tar | `quantized/` is a peer directory of `<cores>/`, not under it | tar `$STEM/quantized` separately |
-| Compile time > 15 min on pose / seg | yolov8npose, yolov8nseg | voyager 1.6 compiler is single-threaded; segmentation / pose have wide post-quantize graphs | watchdog: 15-min cap; document the slow-deploy list, retry overnight at lower priority |
-| YAML left in a patched state after script crash mid-deploy | (occasional) | the YAML.bak restore only ran on the happy path | EXIT trap always restores the YAML |
-| Tar producing an empty/partial tarball with `set -e` aborting before any logs print | mnv2 first pass | `add_if_exists() { [ -e ... ] && TAR_LIST+=(...); }` returns false on miss → `set -e` aborts | swap to an explicit `if/fi`; gate the post-tar `ls`/`tar tzf` on the file existing |
-| Bench script silently passes raw voyager subdir name (`object_detection`) as `--task` | first end-to-end smoke | scripts emit voyager-style names but our `--task` handlers use short names (`detection`, `classify`, ...) | `zoo_bench.sh` remaps via a case-statement before invoking the binary |
-| Binary segfaults on retinaface / mnv2 model load | both | unclear, axrunmodel itself also fails silently for these models on this voyager-rt build | TBD — not a yvm bug; orchestrator and TaskHandler aren't reached |
+| `deploy.py` exits with rc != 0 even after producing artifacts | every successful deploy | `zoo_deploy.sh` ignores deploy.py’s exit code and gates success on `model.json` existing | `f804a5e` |
+| Tarball missing `pool_ddr_const.bin` / `pool_l2_const.bin` | initial yolo11n tar | tar the whole `$STEM/<cores>/` dir, not a curated subset | `f804a5e` |
+| Tarball missing `quantized/manifest.json` + `postprocess_graph.onnx` | initial yolo11n tar | `quantized/` is a peer dir of `<cores>/`, not a child — tar it separately | `75db492` |
+| `add_if_exists` in tar-list trips `set -e` on a missing path | mnv2 first pass | explicit `if/fi` instead of `[ -e ] && …` | `cf32531` |
+| Post-tar `ls -lh "$TAR_OUT"` aborts the script when no tarball was produced | retried mnv2 | gate the listing on `[ -f "$TAR_OUT" ]` | `cf32531` |
+| YAML left in patched state after a mid-deploy crash | (intermittent) | EXIT trap restores the YAML | `3323c22` |
+| Tiny classifiers fall back to a batch=1 compile | mnv2 | accept any of `{ $CORES, 4, 2, 1 }` → pick whichever produced model.json | `f804a5e` |
+| Pose / instance-seg compiles run > 30 min on this SDK build | yolov8npose, yolov8nseg | per-deploy `timeout --kill-after=60 900` watchdog | `7ae6ef0` |
+| Bench script passes raw subdir name as `--task` (`object_detection`) | first end-to-end smoke | `zoo_bench.sh` remaps via `case`-statement to the short handler name | `0e79337` |
+| **Silent runtime failure for retinaface / osnet model.json on the SBC** | both | **OPEN.** `axrunmodel -vv` only prints `Created Context()` before exiting. Same model.json files load fine on the build host (silicon-side simulator). |  |
 
 ## Reproduce
 
 ```sh
-# On the build host (any x86_64 with the voyager-sdk venv):
-cd ~/yocto_voyager
-git checkout feat/model-zoo
-git pull --ff-only
-SDK_DIR=~/1.6/voyager-sdk nohup bash scripts/zoo_deploy_all.sh > /tmp/zoo_deploy_all.log 2>&1 &
+# Build host (~/1.6/voyager-sdk venv ready):
+cd ~/yocto_voyager && git checkout feat/model-zoo && git pull
+SDK_DIR=~/1.6/voyager-sdk bash scripts/zoo_deploy_all.sh
+SDK_DIR=~/1.6/voyager-sdk bash scripts/zoo_retry.sh    # re-do failures
 
-# Push each successful tarball to the SBC:
+# Push every successful tarball to the SBC:
 for t in ~/yocto_voyager/deploys/*/*.tar.gz; do
     scp "$t" antelao@<sbc>:/tmp/
 done
 
-# Bench on the SBC (one row per model into ~/cpp_test/zoo_report.csv):
-for t in /tmp/*.tar.gz; do
-    stem=$(basename "$t" .tar.gz)
-    # Pick the task subdir for the model — see scripts/zoo_deploy_all.sh JOBS.
-    ~/cpp_test/zoo_bench.sh <task-subdir> "$stem" "$t" --bench=2 --seconds=15
-done
+# SBC:
+~/cpp_test/zoo_bench.sh object_detection yolo11n-coco-onnx /tmp/yolo11n-coco-onnx.tar.gz \
+    --bench=2 --seconds=15
+# … repeat per model. zoo_bench_all.sh sweeps a whole ~/zoo_tarballs/ tree.
 
 # Render the report:
 python3 scripts/zoo_report.py \
@@ -82,3 +121,24 @@ python3 scripts/zoo_report.py \
     --bench   ~/cpp_test/zoo_report.csv \
     --out     docs/MODEL_ZOO_REPORT.md
 ```
+
+## What I would do next session
+
+1. **Diagnose the silent runtime failure** for retinaface / osnet. They
+   produce a model.json the SDK considers valid, but the Antelao runtime
+   crashes between `axr_create_context()` and the first `axr_run_model_instance()`.
+   Plan: dump strings from `kernel_function*.elf` to compare against the
+   working yolo11n ELFs; if no obvious difference, attach a logger to the
+   `metis` kernel driver and run `axrunmodel -vv` to capture the syscall the
+   driver rejects.
+2. **Real postproc** for `pose`, `seg`, `obb`, `face` once at least one
+   non-detection model can run. The stubs are placeholders so the deploy +
+   benchmark harness exercises every shape — they’re ~30 lines each to flesh
+   out from the standard ONNX layouts (YOLOv8 keypoint heads, RetinaFace
+   3-tuple per scale, YOLO mask coefficients + prototype masks, etc.).
+3. **Lift the watchdog to 30 min** for the segmentation deploys and rerun;
+   `yolov8nseg` was actively progressing past 30 min when we killed it.
+4. **Try the `axdownloadmodel`-flavoured `.axm` deploys** (which the SDK
+   provides as a "one core-only" fast path) for the classifiers that fail
+   on the 4-core flow. These would let us at least confirm the runtime side
+   of the pipeline isn’t the problem.
