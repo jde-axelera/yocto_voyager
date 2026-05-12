@@ -91,6 +91,12 @@ The yolo11n numbers match what we measured before the model-zoo refactor
 virtual dispatch is free at runtime and the full pipeline still hits ~272 fps
 with annotations and MP4 writing.
 
+### Diagnosed bugs on the build-host side (now fixable)
+
+| Bug | Trigger | Fix |
+|---|---|---|
+| **Cache-poisoned compiler** | A `compilation_config:` block in the YAML makes `voyager-sdk` resolve to a pre-cached older compiler venv under `~/.cache/axelera/venvs/<hash>/` instead of the active 1.6 venv. Tonight's cache had 1.2.5/1.3.1/1.4.0/1.4.2/1.5.3 — the lookup picked `1.5.3` for the YAML hash. `compile_config.json` then reports `compiler_version: 0b25b09` (= the 1.5.3 release commit) even though the active venv is 1.6. | Two options: pass `--aipu-cores=N` on the CLI only and don't patch the YAML (gets batch=1 only, but right compiler); **or** `mv ~/.cache/axelera/venvs ~/.cache/axelera/venvs.bak.$(date +%s)` then patch the YAML (gets batch=4 + right compiler, confirmed tonight). |
+
 ### Smoking-gun ELF mismatch
 
 | File | Pre-existing `~/yolo11n_4c/` (works) | Freshly built today (rejected) |
