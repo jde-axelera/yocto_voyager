@@ -6,9 +6,9 @@ _Branch: `feat/model-zoo`. Overnight run 2026-05-11 → 2026-05-12._
 
 | | Count |
 |---|---|
-| Models attempted | 8 (one representative per task class) |
-| Deploys succeeded on the build host | **3** — `yolo11n-coco-onnx`, `retinaface-mobilenet0.25-widerface-onnx`, `osnet-x1-0-market1501-onnx` |
-| Deploys failed (compile timeout / wrong stem / script bug) | 5 — pose, instance-seg, semantic-seg (timeout); OBB (typo in JOBS); classify (deploy-script bug, retry queued) |
+| Models attempted | 8 (one representative per task class) + 4 retry/bonus |
+| Deploys succeeded on the build host (voyager-sdk 1.6) | **7** — `yolo11n-coco-onnx`, `retinaface-mobilenet0.25-widerface-onnx`, `osnet-x1-0-market1501-onnx`, `mobilenetv2-imagenet-onnx`, `yolo11n-obb-dotav1-onnx`, `resnet18-imagenet-onnx`, `squeezenet1.0-imagenet-onnx` |
+| Deploys failed (compile timeout / wrong stem / script bug) | 2 — `yolov8npose-coco-onnx` and `yolov8nseg-coco-onnx` both run > 30 min single-threaded (15-min watchdog tripped) |
 | Models that loaded + ran on the SBC end-to-end | **1** — `yolo11n-coco-onnx`. **378 fps** `--bench 2` and **272 fps** full-pipeline `--bench 0` (postproc + box draw + h264_rkmpp MP4 mux) via `--py-dispatch` |
 | Models that compiled cleanly but **axrunmodel itself can't load them on this SBC** | All freshly compiled tarballs — including **a freshly recompiled `yolo11n`** with byte-identical `model.json`. The OLD `~/yolo11n_4c/` deploy from May 10 still works fine. |
 
@@ -69,8 +69,12 @@ the runtime accepts only the older set.
 | `obb_detection`           | `yolo11nobb-coco-onnx` *(wrong stem; corrected to `yolo11n-obb-dotav1-onnx` in retry)* | FAIL | — | — |
 | `instance_segmentation`   | `yolov8nseg-coco-onnx`                           | FAIL (compile > 15 min watchdog; killed at 38:34 with 7.7 GB RSS) | — | — |
 | `semantic_segmentation`   | `unet_fcn_512-cityscapes`                        | not reached (bulk aborted at seg stage) | — | — |
-| `face_detection`          | `retinaface-mobilenet0.25-widerface-onnx`        | OK | 1.1 M | **FAIL — silent runtime crash on model load** (axrunmodel also fails) |
-| `embedding`               | `osnet-x1-0-market1501-onnx`                     | OK | 2.2 M | **FAIL — silent runtime crash on model load** (axrunmodel also fails) |
+| `face_detection`          | `retinaface-mobilenet0.25-widerface-onnx`        | OK | 1.1 M | **FAIL — runtime rejects fresh ELFs** (axrunmodel also fails) |
+| `embedding`               | `osnet-x1-0-market1501-onnx`                     | OK | 2.2 M | **FAIL — runtime rejects fresh ELFs** (axrunmodel also fails) |
+| `classification` *retry*  | `mobilenetv2-imagenet-onnx`                      | OK | 3.3 M | FAIL — runtime rejects fresh ELFs |
+| `classification` *retry*  | `resnet18-imagenet-onnx`                         | OK | 11 M  | not yet benched (predicted FAIL by mismatch hypothesis) |
+| `classification` *retry*  | `squeezenet1.0-imagenet-onnx`                    | OK | 1.7 M | FAIL — runtime rejects fresh ELFs |
+| `obb_detection` *retry*   | `yolo11n-obb-dotav1-onnx`                        | OK | 4.9 M | not yet benched (predicted FAIL by mismatch hypothesis) |
 
 ## Detailed bench output (`~/cpp_test/zoo_report.csv` on the SBC)
 
