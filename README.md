@@ -93,7 +93,7 @@ ffplay -probesize 32M -analyzeduration 5M -framedrop tcp://localhost:5050
 | `--fps N` | `25` | per-stream target FPS. For files: `ffmpeg -re -r N` pacing. For `usb:<N>`: device capture rate. |
 | `--usb-size WxH` | `640x480` | capture resolution for any `usb:<N>` entry |
 | `--unpaced` | off | drop ffmpeg `-re` (decode at host speed, benchmark mode) |
-| `--py-dispatch` | off | route the AIPU call through `tools/aipu_worker.py` (Python side-car). Requires `--bench 2` and `--workers 1`. |
+| `--py-dispatch` | off | route the AIPU call through `tools/aipu_worker.py` (Python side-car). Works at any `--bench` level; requires `--workers 1`. |
 | `--py-worker PATH` | `tools/aipu_worker.py` | path to the side-car script |
 | `-d, --display MODE` | `0` | `0`=file only, `1`=local Wayland, `2`=TCP MPEG-TS on :5000 |
 | `--fullscreen` | off | `--display 1` only: ask waylandsink for a fullscreen window |
@@ -162,7 +162,7 @@ even if the AIPU batch reorders them.
 ## Limitations
 
 - All input streams must share resolution.
-- `--py-dispatch` requires `--bench 2` (no postproc / draw / mp4 write while on).
+- `--py-dispatch` requires `--workers 1`.
 - `--fps N` is capped by the source file's native fps; use `--unpaced` to decode at host speed.
 - batch=4 only. Going to batch=1 trades ~15 % throughput for ~70 % lower latency.
 - Fresh `deploy.py` outputs may be silently rejected by the SBC runtime (SDK/runtime version skew). The build host's `~/.cache/axelera/venvs/<hash>/` can bind a deploy to an older cached compiler when `compilation_config:` is in the YAML — pass `--aipu-cores` via the CLI and wipe the cache. Even with the right compiler, the SBC's `axelera-runtime 1.6.0 + axelera-runtime2 0.1.8` doesn't accept current SDK 1.6 ELFs. See [`docs/MODEL_ZOO_REPORT.md` on `feat/model-zoo`](https://github.com/jde-axelera/yocto_voyager/blob/feat/model-zoo/docs/MODEL_ZOO_REPORT.md).
@@ -185,21 +185,15 @@ In rough priority order:
 2. **Wipe `~/.cache/axelera/venvs/` before each deploy** (or stop patching
    the YAML and pass `--aipu-cores` only on the CLI). Avoids the cache-poisoned
    1.5.3 compiler trap.
-3. **Lift the `--py-dispatch` → `--bench 2` restriction.** Map the C++-owned
-   output dma-bufs into the postproc path so full-pipeline runs can also use
-   the side-car. Already prototyped on the
-   [feat/model-zoo branch](https://github.com/jde-axelera/yocto_voyager/tree/feat/model-zoo).
-4. **Generalise to other task classes.** A `TaskHandler` interface + per-task
+3. **Generalise to other task classes.** A `TaskHandler` interface + per-task
    modules (`tasks/detection.cpp` already in place, `classify`/`pose`/`seg`/
    `obb`/`face`/`embed` stubs ready) is on `feat/model-zoo`. Merge once #1 is
    resolved so the model zoo actually runs.
-5. **Ping-pong input dmabufs.** Currently the worker memcpys input N+1 into
-   the dmabuf *after* AIPU run N completes. Two input dmabufs alternating
-   would overlap input prep with AIPU execute — the missing piece between
-   tonight's 380 fps and `axrunmodel`'s 543 fps system.
-6. **Postproc decoders** for the non-detection task modules (currently
-   stubs that exercise preproc + inference only). ~50 lines each from the
-   standard ONNX layouts; gated on #1.
+4. **Ping-pong input dmabufs.** The worker memcpys input N+1 *after* AIPU run
+   N completes. Two input dmabufs alternating would overlap input prep with
+   AIPU execute — the missing piece between 380 fps and `axrunmodel`'s 543 fps.
+5. **Postproc decoders** for the non-detection task modules (currently stubs
+   exercising preproc + inference only). ~50 lines each; gated on #1.
 
 ---
 
