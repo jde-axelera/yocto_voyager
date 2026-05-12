@@ -10,7 +10,7 @@ _Branch: `feat/model-zoo`. Overnight run 2026-05-11 → 2026-05-12._
 | Deploys succeeded on the build host (voyager-sdk 1.6) | **7** — `yolo11n-coco-onnx`, `retinaface-mobilenet0.25-widerface-onnx`, `osnet-x1-0-market1501-onnx`, `mobilenetv2-imagenet-onnx`, `yolo11n-obb-dotav1-onnx`, `resnet18-imagenet-onnx`, `squeezenet1.0-imagenet-onnx` |
 | Deploys failed (compile timeout / wrong stem / script bug) | 2 — `yolov8npose-coco-onnx` and `yolov8nseg-coco-onnx` both run > 30 min single-threaded (15-min watchdog tripped) |
 | Models that loaded + ran on the SBC end-to-end | **1** — `yolo11n-coco-onnx`. **378 fps** `--bench 2` and **272 fps** full-pipeline `--bench 0` (postproc + box draw + h264_rkmpp MP4 mux) via `--py-dispatch` |
-| Models that compiled cleanly but **axrunmodel itself can't load them on this SBC** | All freshly compiled tarballs — including **a freshly recompiled `yolo11n`** with byte-identical `model.json`. The OLD `~/yolo11n_4c/` deploy from May 10 still works fine. |
+| Models that compiled cleanly but **axrunmodel itself can't load them on this SBC** | **All 7 freshly compiled tarballs from voyager-sdk 1.6, plus a 1.5.3 yolo11n test build.** A freshly recompiled `yolo11n` with byte-identical `model.json` to the working deploy still fails — only the on-disk May-10 `~/yolo11n_4c/` deploy runs. Root cause: SDK/runtime version skew (see "What I would do next session"). |
 
 The C++ side of the work — the `TaskHandler` abstraction, the deploy + bench
 harness, the disk-rotation discipline — is solid. **The blocking issue tonight
@@ -149,16 +149,23 @@ python3 scripts/zoo_report.py \
 
 ## What I would do next session
 
-1. **Resolve the SDK/runtime mismatch.** Two pragmatic paths:
-   - Use voyager-sdk 1.5.3 (also checked out at `~/1.5.3/voyager-sdk` on the
-     build host) — it predates whatever codegen change the 1.6 SDK made and
-     should produce ELFs the SBC accepts.
-   - Or upgrade the SBC's `axelera-rt` pip package to match the build host's
-     SDK version; the SBC's pip venv at `~/axelera_pip/axelera-env/` is the
-     thing that needs to be in lockstep with the compiler.
-   Either path unblocks every model in the JOBS list — `scripts/zoo_retry.sh`
-   already proves `mnv2`, `yolo11n-obb-dotav1`, and `resnet18` deploy cleanly;
-   they just don't run on this runtime.
+1. **Resolve the SDK/runtime mismatch.** I tested the obvious workaround
+   (deploy with the older `~/1.5.3/voyager-sdk` checkout) — same result:
+   `axrunmodel` silently exits between `Created Context()` and the first
+   `instance.run()`. So **neither 1.6 nor 1.5.3 produces ELFs that this SBC
+   accepts**; the only working deploy is the pre-existing May-10 yolo11n
+   that's already on the SBC at `~/yolo11n_4c/`. The root cause is therefore
+   either:
+   - the SBC's installed `axelera-rt` is older than both SDKs on the build
+     host — `pip install --upgrade` into `~/axelera_pip/axelera-env/` against
+     the same artifactory the build host pulled from should bring the two
+     into version-lockstep; or
+   - the AIPU's on-device firmware (loaded by the kernel `metis` driver)
+     predates these SDKs, in which case the firmware needs to be reflashed
+     to a build that matches.
+   Once one of these is fixed, `scripts/zoo_retry.sh` already proves the
+   builds themselves are clean — every entry in the JOBS list will simply
+   start running.
 2. **Real postproc** for `pose`, `seg`, `obb`, `face` once non-detection
    models can actually run. The stubs are placeholders so the deploy +
    benchmark harness exercises every shape — each is ~30 lines from the
