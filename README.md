@@ -161,33 +161,14 @@ even if the AIPU batch reorders them.
 
 ## Limitations
 
-- **All input streams must share the same resolution.** Composite + model preproc
-  assume a uniform per-stream cell size.
-- **`--py-dispatch` is `--bench 2` only** on this branch. Outputs land in the
-  side-car's heap and aren't ferried back into per-frame buffers, so no postproc
-  / draw / mp4 write while it's on. Use `--py-dispatch` for the dispatch-ceiling
-  benchmark; use the default path (no `--py-dispatch`) for the demo with boxes.
-- **Source-rate cap on file inputs.** `--fps N` higher than the file's native fps
-  doesn't actually deliver more frames — ffmpeg's `-r N` just re-stamps. Use
-  `--unpaced` (drops `-re`) to decode at host speed for benchmarks.
-- **Batch=4 only.** Switching to batch=1 with `--workers N` would give lower
-  latency (~14 ms vs ~50 ms) at the cost of ~15 % throughput; the current
-  deploy is throughput-tuned.
-- **Fresh `deploy.py` outputs can be rejected by the SBC runtime.** Tonight's
-  diagnosis: voyager-sdk caches per-config compiler venvs under
-  `~/.cache/axelera/venvs/<hash>/` — adding `compilation_config:` to the YAML
-  binds the deploy to whatever compiler version is cached (often older than the
-  active venv's). Even after fixing that, the SBC's `axelera-runtime 1.6.0 +
-  axelera-runtime2 0.1.8` silently rejects ELFs produced by today's SDK 1.6
-  build. Only the pre-existing yolo11n on the SBC currently runs end-to-end;
-  see the [model-zoo branch report](https://github.com/jde-axelera/yocto_voyager/blob/feat/model-zoo/docs/MODEL_ZOO_REPORT.md)
-  for the full investigation.
-- **`librga` + **NEON** dead-ends documented.** The Voyager 1.3.1 librga
-  singleton-destroyed bug makes the RGA resize path unusable; the NEON pack
-  variant doubles memory bandwidth and regresses to ~235 fps. The single-pass
-  scalar code is at the memory-bandwidth limit already.
-- **Auto-respawn covers the display child only** — wrap the whole binary in a
-  systemd unit if you need it to survive its own crash.
+- All input streams must share resolution.
+- `--py-dispatch` requires `--bench 2` (no postproc / draw / mp4 write while on).
+- `--fps N` is capped by the source file's native fps; use `--unpaced` to decode at host speed.
+- batch=4 only. Going to batch=1 trades ~15 % throughput for ~70 % lower latency.
+- Fresh `deploy.py` outputs may be silently rejected by the SBC runtime (SDK/runtime version skew). The build host's `~/.cache/axelera/venvs/<hash>/` can bind a deploy to an older cached compiler when `compilation_config:` is in the YAML — pass `--aipu-cores` via the CLI and wipe the cache. Even with the right compiler, the SBC's `axelera-runtime 1.6.0 + axelera-runtime2 0.1.8` doesn't accept current SDK 1.6 ELFs. See [`docs/MODEL_ZOO_REPORT.md` on `feat/model-zoo`](https://github.com/jde-axelera/yocto_voyager/blob/feat/model-zoo/docs/MODEL_ZOO_REPORT.md).
+- librga 2.1.0 (Voyager 1.3.1) has a singleton-destroyed bug — RGA resize path unusable.
+- NEON pack variant regresses to ~235 fps (memory-bandwidth bound). Scalar single-pass is already at the bw limit.
+- No process-level auto-restart. Wrap in systemd for long-running.
 
 ---
 
