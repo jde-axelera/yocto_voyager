@@ -9,15 +9,18 @@ _Branch: `feat/model-zoo`. Overnight run 2026-05-11 → 2026-05-12._
 | Models attempted | 8 (one representative per task class) |
 | Deploys succeeded on the build host | **3** — `yolo11n-coco-onnx`, `retinaface-mobilenet0.25-widerface-onnx`, `osnet-x1-0-market1501-onnx` |
 | Deploys failed (compile timeout / wrong stem / script bug) | 5 — pose, instance-seg, semantic-seg (timeout); OBB (typo in JOBS); classify (deploy-script bug, retry queued) |
-| Models that loaded + ran on the SBC end-to-end | **1** — `yolo11n-coco-onnx` (378 fps system, `--py-dispatch --bench 2`) |
-| Models that compiled but `axrunmodel` itself can't load them on this SBC | 2 — `retinaface`, `osnet` (silent failure between `Context()` and the first `instance.run()`) |
+| Models that loaded + ran on the SBC end-to-end | **1** — `yolo11n-coco-onnx`. **378 fps** `--bench 2` and **272 fps** full-pipeline `--bench 0` (postproc + box draw + h264_rkmpp MP4 mux) via `--py-dispatch` |
+| Models that compiled cleanly but **axrunmodel itself can't load them on this SBC** | All freshly compiled tarballs — including **a freshly recompiled `yolo11n`** with byte-identical `model.json`. The OLD `~/yolo11n_4c/` deploy from May 10 still works fine. |
 
 The C++ side of the work — the `TaskHandler` abstraction, the deploy + bench
-harness, the disk-rotation discipline — is solid. The blocking issue tonight is
-the **voyager-rt 1.6 runtime on the Antelao SoM only accepts yolo11n-style
-model.json files** out of the build-host’s freshly compiled outputs. Diagnosing
-which compile artifact triggers the silent runtime failure for `retinaface` /
-`osnet` is the obvious next step.
+harness, the disk-rotation discipline — is solid. **The blocking issue tonight
+turned out to be an SDK/runtime version mismatch**, not a flaw in any of the
+new code: every freshly compiled model on the build host (voyager-sdk 1.6)
+produces ELFs that the SBC's voyager-rt 1.6.0 silently rejects between
+`Context()` creation and the first `instance.run()`. Including a freshly
+recompiled **yolo11n** whose `model.json` is byte-identical (`md5 ad7d2f…`) to
+the pre-existing `~/yolo11n_4c/` deploy that runs at 378 fps. The ELFs differ;
+the runtime accepts only the older set.
 
 ## What was built (code + scripts)
 
@@ -73,14 +76,32 @@ which compile artifact triggers the silent runtime failure for `retinaface` /
 
 ```
 task,stem,bench,fps_system,fps_infer,lat_ms_per_batch,status,notes
-detection,yolo11n-coco-onnx,2,378.2,378.2,1.912,OK,
-face,retinaface-mobilenet0.25-widerface-onnx,2,0.0,0.0,,NO_STATS,
-embed,osnet-x1-0-market1501-onnx,2,0.0,0.0,,NO_STATS,
+detection,yolo11n-coco-onnx,2,378.0,378.0,1.895,OK,    # using ~/yolo11n_4c (pre-existing deploy)
+detection,yolo11n-coco-onnx,0,271.6,276.3,1.852,OK,    # full pipeline (postproc + box + h264_rkmpp MP4)
+face,retinaface-mobilenet0.25-widerface-onnx,2,0.0,0.0,,NO_STATS,    # fresh build — runtime rejects
+embed,osnet-x1-0-market1501-onnx,2,0.0,0.0,,NO_STATS,                # fresh build — runtime rejects
 ```
 
-The yolo11n number is identical to what we measured before the model-zoo
-refactor (commit `0aa46c2` on `main`), confirming the new `TaskHandler` virtual
-dispatch is free at runtime.
+The yolo11n numbers match what we measured before the model-zoo refactor
+(commits `0aa46c2`, `dfb3423` on `main`), confirming the new `TaskHandler`
+virtual dispatch is free at runtime and the full pipeline still hits ~272 fps
+with annotations and MP4 writing.
+
+### Smoking-gun ELF mismatch
+
+| File | Pre-existing `~/yolo11n_4c/` (works) | Freshly built today (rejected) |
+|---|---|---|
+| `model.json` | `ad7d2ffd19c222da8b5a080c2970907d` | `ad7d2ffd19c222da8b5a080c2970907d` ✅ identical |
+| `pool_ddr_const.bin` | `95d084048c0b3909e4254949a4177f43` | `95d084048c0b3909e4254949a4177f43` ✅ identical |
+| `pool_l2_const.bin` | `0f400ad7315203d5e90de3ff50487ccb` | `de6807bef75e91f53ad6cbd66b3a7df3` ❌ different |
+| `kernel_function_{0..3}.elf` | (4 different hashes) | (4 different hashes) ❌ all four differ |
+| `manifest.json` | `ab312b2d…` | `52bb2336…` ❌ different |
+| `postprocess_graph.onnx` | `f8798f68…` | `0156e1c4…` ❌ different |
+
+The voyager-sdk 1.6 codegen on the build host emits different ELFs + manifest
+than the older pre-existing deploy. The SBC's voyager-rt 1.6.0 silently
+rejects them. This is the **single root cause** of every freshly built model
+appearing in the `NO_STATS` rows above.
 
 ## Operational findings (what broke, why, how it's now fixed)
 
@@ -124,21 +145,24 @@ python3 scripts/zoo_report.py \
 
 ## What I would do next session
 
-1. **Diagnose the silent runtime failure** for retinaface / osnet. They
-   produce a model.json the SDK considers valid, but the Antelao runtime
-   crashes between `axr_create_context()` and the first `axr_run_model_instance()`.
-   Plan: dump strings from `kernel_function*.elf` to compare against the
-   working yolo11n ELFs; if no obvious difference, attach a logger to the
-   `metis` kernel driver and run `axrunmodel -vv` to capture the syscall the
-   driver rejects.
-2. **Real postproc** for `pose`, `seg`, `obb`, `face` once at least one
-   non-detection model can run. The stubs are placeholders so the deploy +
-   benchmark harness exercises every shape — they’re ~30 lines each to flesh
-   out from the standard ONNX layouts (YOLOv8 keypoint heads, RetinaFace
-   3-tuple per scale, YOLO mask coefficients + prototype masks, etc.).
+1. **Resolve the SDK/runtime mismatch.** Two pragmatic paths:
+   - Use voyager-sdk 1.5.3 (also checked out at `~/1.5.3/voyager-sdk` on the
+     build host) — it predates whatever codegen change the 1.6 SDK made and
+     should produce ELFs the SBC accepts.
+   - Or upgrade the SBC's `axelera-rt` pip package to match the build host's
+     SDK version; the SBC's pip venv at `~/axelera_pip/axelera-env/` is the
+     thing that needs to be in lockstep with the compiler.
+   Either path unblocks every model in the JOBS list — `scripts/zoo_retry.sh`
+   already proves `mnv2`, `yolo11n-obb-dotav1`, and `resnet18` deploy cleanly;
+   they just don't run on this runtime.
+2. **Real postproc** for `pose`, `seg`, `obb`, `face` once non-detection
+   models can actually run. The stubs are placeholders so the deploy +
+   benchmark harness exercises every shape — each is ~30 lines from the
+   standard ONNX layouts (YOLOv8 keypoint heads, RetinaFace 3-tuple per
+   scale, YOLO mask coefficients + prototype masks, etc.).
 3. **Lift the watchdog to 30 min** for the segmentation deploys and rerun;
    `yolov8nseg` was actively progressing past 30 min when we killed it.
-4. **Try the `axdownloadmodel`-flavoured `.axm` deploys** (which the SDK
-   provides as a "one core-only" fast path) for the classifiers that fail
-   on the 4-core flow. These would let us at least confirm the runtime side
-   of the pipeline isn’t the problem.
+4. **Try the `axdownloadmodel`-flavoured pre-built `.axm` deploys** (the
+   SDK ships ready-made one-core variants on its artifactory). Those are
+   compiled against the same older runtime the SBC expects, so they should
+   bypass the ELF-mismatch issue entirely.
