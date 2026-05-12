@@ -1,194 +1,79 @@
 # yocto_voyager
 
-End-to-end **YOLOv11n inference pipeline** for the **Axelera Metis AIPU on an Antelao SoM (RK3588 + Voyager Linux)**, written in C++. Reads 1–10 H.264 input streams, paces each to a configurable FPS, runs object detection on the AIPU, draws bounding boxes + labels on every frame, and emits one annotated MP4 per stream **plus** an optional live auto-sized composite grid display (X11 locally or TCP MPEG-TS H.264 for remote viewing).
+End-to-end **YOLOv11n inference pipeline** for the **Axelera Metis AIPU on an
+Antelao SoM (RK3588 + Voyager Linux)**, in C++. Reads 1–10 H.264 streams (or
+USB cameras), runs detection on the AIPU, writes one annotated MP4 per stream,
+and optionally serves a composite display window (local Wayland or TCP MPEG-TS
+H.264 for remote viewing).
 
 | 1 stream (1×1) | 4 streams (2×2) | 10 streams (4×3) |
 |---|---|---|
 | ![](docs/images/hud_grid_n1.png) | ![](docs/images/hud_grid_n4.png) | ![](docs/images/hud_grid_n10.png) |
 
-The composite display grid is auto-sized from the stream count: `cols = ⌈√N⌉`, `rows = ⌈N/cols⌉` (same shape `voyager-sdk`'s `display.App` window uses). With one stream the composite is the full source frame; with more streams each cell shrinks proportionally and unused cells stay black. A single live HUD — **E2E fps · Infer fps · CPU %** — is overlaid once at the top-left of the composite (refreshed every second from `/proc/stat`), instead of one HUD per stream.
+Composite grid auto-sizes from the stream count (`cols = ⌈√N⌉, rows = ⌈N/cols⌉`).
+A single overall HUD — **E2E fps · Infer fps · CPU %** — is drawn once at the
+top-left of the composite, sampled once a second from `/proc/stat`.
 
 ---
 
-## What you get
+## What's in the repo
 
-- `src/yolo_demo_multi.cpp` plus a handful of focused modules under `src/` — the C++ source, ~2500 lines total (not counting baked data: COCO names, palette, Liberation Sans Bold TTF, stb_truetype). Each module owns one piece of the pipeline (preproc, postproc, dma-heap pool, drawing, TTF font, subprocess wiring, optional Python side-car client).
-- `scripts/01_update_driver.sh` ... `05_run.sh` — five short shell scripts that take you from a fresh SBC to a running demo.
-- `src/CMakeLists.txt` + `toolchain-aarch64.cmake` — cross-build setup for any x86_64 Linux build host.
-- This README, plus reproducible per-step notes and the full FPS/latency analysis below.
+- `src/` — ~2 500 lines of C++ split into focused modules (preproc, postproc,
+  dma-heap pool, drawing, TTF, subprocess wiring, Python AIPU side-car client).
+- `scripts/01..05_*.sh` — five idempotent scripts from "fresh SBC" to "running demo".
+- `tools/aipu_worker.py` — Python side-car invoked by `--py-dispatch` (recovers
+  the runtime's prefill/async pipeline that the public C API doesn't expose).
+- `src/CMakeLists.txt` + `toolchain-aarch64.cmake` — cross-build from any
+  x86_64 Linux build host.
 
 ---
 
 ## Prerequisites
 
-You need **two machines**:
+1. **Target board** — Antelao SoM running Voyager Linux 1.3.1
+   (`BOARD_TYPE=antelao-3588`, kernel 6.1.148-rockchip-standard, aarch64).
+2. **Build host** — x86_64 Ubuntu 22.04 + Voyager SDK 1.6 checkout (for `deploy.py`).
 
-1. **The target board** — an Antelao SoM (RK3588 + Metis AIPU on-module) running **Voyager Linux 1.3.1**.
-   - `BOARD_TYPE=antelao-3588`, kernel `6.1.148-rockchip-standard`, aarch64.
-   - Default non-root user (typically `antelao`) with `su` to root using the documented default root password.
-   - Internet access (for fetching the kernel `.deb` and pip packages).
-2. **An x86_64 Linux build host** — used to (a) cross-compile the C++ binary and (b) compile YOLOv11n for 4 AIPU cores using the full Voyager SDK.
-   - Ubuntu 22.04 LTS works out-of-the-box. WSL2 also works.
-   - The full **Voyager SDK 1.6** checkout from Axelera (the source you use for `deploy.py`). The pip `axelera-rt` package alone is not enough on the build host.
-
-You don't need any of the following on the target SBC: a C/C++ compiler, kernel headers, GStreamer development libraries, OpenCV, or sudo. Everything that talks to the AIPU is delivered via pip wheels, and the C++ binary is cross-built on the build host.
+The target SBC needs no C/C++ compiler, kernel headers, GStreamer dev, OpenCV,
+or sudo. Everything that talks to the AIPU is delivered via pip wheels.
 
 ---
 
-## End-to-end quickstart
-
-The repo is organised as five sequential steps. Each one is idempotent — you can re-run it. Most of them are tiny.
-
-### Step 1 — Update the Metis kernel driver (on the SBC, as root)
-
-A fresh image ships `metis.ko 1.4.4`. `axelera-rt 1.6.0` refuses to open the device unless the driver is `≥ 1.4.10`. The fix is a pre-built `.deb` published by Amarula that targets this exact kernel build, so no compilation is needed.
+## Quickstart (five steps)
 
 ```sh
-# copy this script onto the SBC (any way you like — scp, USB, paste through SSH, etc.)
-# then on the SBC:
-su        # default root password: AxeRoot2025
-sh 01_update_driver.sh
-```
+# 1. Update Metis kernel driver to ≥ 1.4.10  (on the SBC, as root)
+sh 01_update_driver.sh                  # reboots; check /sys/class/metis/version
 
-The script downloads the kernel-module-metis `.deb`, remounts the rootfs read-write, `dpkg -i`s it, adds `metis` to `/etc/modules-load.d`, and reboots. After the reboot, check:
+# 2. Install axelera-rt venv             (on the SBC, as the default user)
+sh 02_install_runtime.sh                # creates ~/axelera_pip/axelera-env/
 
-```sh
-cat /sys/class/metis/version    # → 1.4.16
-```
+# 3. Compile yolo11n for 4 AIPU cores    (on the build host)
+SDK_DIR=~/voyager-sdk-1.6 sh 03_deploy_model.sh
+# → produces yolo11n_4core.tar.gz (~20 MB). scp to SBC, extract to ~/yolo11n_4c/.
 
-### Step 2 — Install the Axelera runtime (on the SBC, as the default user)
+# 4. Cross-compile the binary            (on the build host)
+sh 04_build.sh                          # → build/yolo_demo_multi (aarch64 ELF)
 
-```sh
-sh 02_install_runtime.sh
-```
-
-This creates `~/axelera_pip/axelera-env/` (a Python 3.10 venv) and pip-installs `axelera-rt` + its dependencies from the Axelera artifactory. The script also runs `axdevice` as a smoke test — you should see:
-
-```
-Device 0: metis-0:1:0 4GiB metis-compute-board flver=1.5.0 bcver=7.1 clock=800MHz(0-3:800MHz) mvm=0-3:100%
-```
-
-`axelera-devkit` (the compiler-side pip package) is **not** installed; its transitive dependency `onnxoptimizer` has no aarch64 wheel and there's no C++ host compiler on Voyager Linux to build it from source. Compilation is done off-board on the build host.
-
-### Step 3 — Compile YOLOv11n for 4 AIPU cores (on the build host)
-
-`axdownloadmodel yolo11n-coco-onnx --axm` returns a 1-AIPU-core deploy, which caps device throughput at ~135 fps. For the full ~870 fps device ceiling we need a 4-core build, which means setting `compilation_config.aipu_cores_used: 4` and `resources_used: 1.0` in the model YAML before running `deploy.py`.
-
-On the build host (the script does this for you):
-
-```sh
-# Point SDK_DIR at your voyager-sdk-1.6 checkout
-export SDK_DIR=~/voyager-sdk-1.6
-sh 03_deploy_model.sh
-```
-
-This patches the YAML, runs `deploy.py --mode QUANTCOMPILE --aipu-cores=4`, and tars the resulting build directory to `yolo11n_4core.tar.gz` (~20 MB). Compile takes ~4 minutes.
-
-(The pipeline's last step will print `Model(s): yolo11n-coco-onnx not deployed` — that's a downstream metadata check; the model.json + 4 kernel ELFs are fully usable.)
-
-Copy the tarball to the SBC and extract:
-
-```sh
-# from the build host
-scp yolo11n_4core.tar.gz <user>@<sbc-ip>:~/
-# on the SBC
-mkdir -p ~/yolo11n_4c && tar xzf ~/yolo11n_4core.tar.gz -C ~/yolo11n_4c
-```
-
-The model path on the SBC is now:
-
-```
-~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json
-```
-
-### Step 4 — Cross-compile the demo (on the build host)
-
-```sh
-sh 04_build.sh
-```
-
-This script will, in order:
-
-1. `apt install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu cmake` if you don't already have them.
-2. Download the `axelera-runtime` + `axelera-runtime2` aarch64 wheels and extract them into `sysroot/axelera/` (so we have `libaxruntime.so`, headers, CMake configs, etc. for the cross-link).
-3. Run CMake + make. Output is `build/yolo_demo_multi` (~1.8 MB, aarch64 ELF, statically linked libstdc++/libgcc).
-
-Copy the binary to the SBC:
-
-```sh
-scp build/yolo_demo_multi <user>@<sbc-ip>:~/cpp_test/
-```
-
-### Step 5 — Run on the SBC
-
-```sh
-mkdir -p ~/cpp_test/multi_out
-cd ~/cpp_test
-
-# Single-stream example: 60 fps, file output only.
+# 5. Run                                 (on the SBC)
 sh 05_run.sh ./yolo_demo_multi \
     --model   ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
-    --inputs  ~/some_video.mp4 \
+    --inputs  some_video.mp4 \
     --out     ~/cpp_test/multi_out/single \
-    --fps     60
+    --fps     60 --display 2
 ```
 
-For 10 streams at 25 fps each, with composite TCP H.264 display on port 5000:
+**USB cameras** — any `--inputs` entry starting with `usb:<N>` opens
+`/dev/video<N>` over V4L2 (MJPEG → BGR24). `--usb-size WxH` sets resolution
+(default `640x480`). Mix files and cameras freely as long as they share resolution.
+
+**Remote viewing** — `--display 2` exposes an MPEG-TS H.264 listener on TCP/5000.
+From your laptop:
 
 ```sh
-VIDEO=~/some_video.mp4
-INPUTS=$(python3 -c "print(','.join(['$VIDEO']*10))")
-
-sh 05_run.sh ./yolo_demo_multi \
-    --model   ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
-    --inputs  "$INPUTS" \
-    --out     ~/cpp_test/multi_out/s \
-    --fps     25 \
-    --display 2
+ssh -fNL 5050:localhost:5000 <user>@<sbc-ip>     # macOS: avoid local :5000 (AirPlay)
+ffplay -probesize 32M -analyzeduration 5M -framedrop tcp://localhost:5050
 ```
-
-**USB camera input** — any entry in `--inputs` of the form `usb:<N>` is opened as
-`/dev/video<N>` over V4L2 (MJPEG → BGR24). `--usb-size WxH` sets the capture
-resolution (default `640x480`) and `--fps` is used as the device framerate. You
-can pass several USB cameras, several files, or a mix — but all streams must
-end up at the same resolution.
-
-```sh
-# single Logitech / UVC webcam at 640x480 @ 30 fps
-sh 05_run.sh ./yolo_demo_multi \
-    --model    ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
-    --inputs   usb:0 \
-    --out      ~/cpp_test/multi_out/cam \
-    --usb-size 640x480 \
-    --fps      30 \
-    --display  2
-
-# two USB cameras side-by-side
-sh 05_run.sh ./yolo_demo_multi -m model.json -i usb:0,usb:2 -o /tmp/cams \
-    --usb-size 640x480 --fps 30 --display 2
-
-# mix file + USB camera (file must already be 640x480 here)
-sh 05_run.sh ./yolo_demo_multi -m model.json -i clip_640x480.mp4,usb:0 -o /tmp/mix \
-    --usb-size 640x480 --fps 30 --display 2
-```
-
-(Run `./yolo_demo_multi --help` for the full flag reference.)
-
-The run prints a `[stats]` line every 2 s with per-stream and aggregate FPS. Stop with **Ctrl-C** — every output MP4 closes cleanly with a valid `moov` atom.
-
-To view the live composite from a remote machine (e.g., a laptop), tunnel the SBC's TCP port 5000 to a local port and open it in `ffplay`:
-
-```sh
-# on the laptop (one-time per session)
-ssh -fNL 5050:<sbc-ip>:5000 <user>@<sbc-ip>
-# or, if the SBC isn't directly reachable, through a jump host:
-ssh -fNL 5050:<sbc-ip>:5000 -J <user>@<jump-host> <user>@<sbc-ip>
-
-# play (reconnect anytime — the streamer auto-respawns)
-ffplay -fflags nobuffer -flags low_delay -probesize 100k tcp://localhost:5050
-```
-
-> **Note on macOS:** macOS's AirPlay Receiver listens on `tcp/5000`, so you must use a different local port (e.g. `5050`) for the SSH tunnel.
 
 ---
 
@@ -200,230 +85,140 @@ ffplay -fflags nobuffer -flags low_delay -probesize 100k tcp://localhost:5050
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-m, --model PATH` | *required* | path to `model.json` or `.axm` (from `03_deploy_model.sh`) |
-| `-i, --inputs CSV` | *required* | 1–10 comma-separated inputs. Each entry is either a file path (`.mp4` or anything ffmpeg can read) or `usb:<N>` for `/dev/video<N>`. All streams must share resolution. |
-| `-o, --out PREFIX` | *required* | output mp4 path prefix → writes `<PREFIX>_0.mp4 ... <PREFIX>_N-1.mp4` |
+| `-m, --model PATH` | *required* | path to `model.json` or `.axm` |
+| `-i, --inputs CSV` | *required* | 1–10 inputs; entry is a file path or `usb:<N>`. All streams must share resolution. |
+| `-o, --out PREFIX` | *required* | output mp4 prefix → `<PREFIX>_0.mp4 … <PREFIX>_N-1.mp4` |
 | `--conf FLOAT` | `0.25` | detection confidence threshold |
 | `--iou FLOAT` | `0.45` | NMS IoU threshold |
-| `--fps N` | `25` | per-stream target FPS. For files: `ffmpeg -re -r N` pacing. For `usb:<N>`: device capture framerate. |
-| `--usb-size WxH` | `640x480` | capture resolution for any `usb:<N>` entry (UVC MJPEG). If you mix with a file, set this to match the file's resolution. |
-| `--preproc N` | `4` | preprocess thread count |
-| `--unpaced` | off | drop ffmpeg `-re` on file inputs so frames decode as fast as possible (benchmark mode; ignored for `usb:<N>`) |
-| `--py-dispatch` | off | route the AIPU call through `tools/aipu_worker.py` — recovers the runtime's internal pipeline. Currently requires `--bench 2` and `--workers 1`. See [`--py-dispatch`](#closing-the-gap-to-axrunmodel-with---py-dispatch) below. |
-| `--py-worker PATH` | `tools/aipu_worker.py` | path to the Python side-car script (used only with `--py-dispatch`) |
-| `-d, --display MODE` | `0` | `0`=file only, `1`=local X11 composite, `2`=TCP MPEG-TS composite on port 5000 |
+| `--fps N` | `25` | per-stream target FPS. For files: `ffmpeg -re -r N` pacing. For `usb:<N>`: device capture rate. |
+| `--usb-size WxH` | `640x480` | capture resolution for any `usb:<N>` entry |
+| `--unpaced` | off | drop ffmpeg `-re` (decode at host speed, benchmark mode) |
+| `--py-dispatch` | off | route the AIPU call through `tools/aipu_worker.py` (Python side-car). Requires `--bench 2` and `--workers 1`. |
+| `--py-worker PATH` | `tools/aipu_worker.py` | path to the side-car script |
+| `-d, --display MODE` | `0` | `0`=file only, `1`=local Wayland, `2`=TCP MPEG-TS on :5000 |
+| `--fullscreen` | off | `--display 1` only: ask waylandsink for a fullscreen window |
+| `--boxes-only` | off | draw colour-coded detection boxes on each stream (otherwise streams pass through clean) |
 | `-b, --bench MODE` | `0` | `0`=full pipeline, `1`=skip draw+write, `2`=preproc+infer only |
-| `-w, --workers N` | `1` | inference instances; only meaningful for batch=1 deploys (warning is printed if `>1`) |
-| `-h, --help` |  | print the full flag reference and exit |
-
-The CLI is fully named — order of flags does not matter, and flags can be specified in either long (`--model PATH`) or short (`-m PATH`) form.
+| `-w, --workers N` | `1` | inference instances (batch=4 deploy: keep at 1) |
 
 ---
 
-## How it works
+## Performance (measured on this SBC, yolo11n 4-core deploy, batch=4)
 
-Pipeline (single AIPU instance; the model is compiled for batch=4 and uses all 4 sub-devices in one call):
-
-```
-[stream 0..N-1]  →  decoders  →  raw_q  →  preproc threads  →  inst_q
-                                                                   │
-                                                                   ↓
-                                          worker (batch-4 packing) → axr_run_model_instance
-                                                                   ↓
-                                                                done_q
-                                                                   ↓
-                                                          drawer (per-stream
-                                                                   reorder map)
-                                                                   ↓
-                                                          per-stream write_q
-                                                                   ↓
-                                                          per-stream writer  →  h264_rkmpp mp4
-
-Optional (live display, decoupled):
-       drawer  →  per-stream snapshot mutex  →  display producer (30 Hz, 4×4 grid)
-                                                       ↓
-                                                LeakyOne<vector<uint8_t>>   (overwrite-newest, 1-deep)
-                                                       ↓
-                                                display consumer (blocking write_full → ffmpeg/gst-launch)
-                                                       ↓
-                                                ffmpeg h264_rkmpp → TCP   /   gst-launch ! autovideosink
-```
-
-Key design choices:
-
-- **Batch-4 packing across streams.** The model is compiled for batch=4. Frames from any of the 10 streams are accumulated by the worker until it has 4, then packed into the model's NHWC input slot (4 × 1.68 MB) via memcpy into a single dma-heap dmabuf. Each output tensor is then sliced 4 ways and dispatched back to each frame.
-- **`input_dmabuf=1` via `/dev/dma_heap/system`.** The worker holds a 4-slot input buffer mmap'd as both a dmabuf fd (passed to `axr_run_model_instance`) and a CPU pointer (written by preproc). `DMA_BUF_IOCTL_SYNC` flushes are issued around CPU writes.
-- **`double_buffer=1`** in axruntime properties.
-- **`output_dmabuf=0`** — the `axrunmodel --explore-latency` sweep shows host-allocated output buffers are fastest for our pipeline.
-- **Per-stream reorder buffer in the drawer.** Each `Stream` keeps its own `pending` map keyed by per-stream frame index, so the writer for stream N receives frames strictly in order.
-- **Display is fully decoupled from inference.** The drawer mutex-writes a snapshot of each stream's most recent annotated frame. A separate producer thread, paced at 30 Hz, decimates each snapshot by integer nearest-neighbour (factors `cols`/`rows`) and tiles it into an **auto-sized grid** chosen as `cols = ⌈√N⌉, rows = ⌈N/cols⌉` (same shape `voyager-sdk`'s `display.App` uses): N=1 → 1×1 full window, N=4 → 2×2, N=10 → 4×3, etc. Unused cells stay black. The composite is pushed through a **1-deep leaky slot** to a separate consumer thread that does atomic `write_full()` to the display subprocess and respawns it on viewer disconnect. Inference never blocks on the display path.
-- **Overall HUD overlaid once on the composite.** The producer thread also draws a single status line — *E2E fps · Infer fps · CPU %* — at the top-left of the composite (not per stream). Counters are sampled once per second by diffing per-stream `drawn`, the global `frames_inferred`, and `/proc/stat`. This keeps small cells uncluttered when N is large.
-- **TTF text rendering**: `stb_truetype.h` (single-header, public domain) + `LiberationSans-Bold.ttf` baked as a C array. Pre-rasterised glyph atlases at 14 px (labels) and 18 px (HUD). Per-glyph blits use 8-bit alpha against the BGR frame buffer.
-- **Curated 80-class COCO palette** so the same class consistently gets the same colour.
-- **Graceful shutdown**: `SIGINT`/`SIGTERM` triggers an orderly drain — decoders return, queues close, all writer stdin fds are closed in parallel so every ffmpeg child can finalise its `moov` atom simultaneously, then we wait up to 15 s before SIGTERM/SIGKILL.
-- **`SIGPIPE` ignored** so the app survives the display subprocess dying when a viewer disconnects.
-
----
-
-## FPS and latency
-
-All measured on the same Antelao SoM, with the same 4-core `.axm` deploy.
-
-| Path | Visible FPS | Latency / call | Comment |
-|---|---|---|---|
-| Pure AIPU device (`axrunmodel` `--explore-latency`, best config) | **~870** | 1.15 ms / frame | silicon ceiling |
-| GStreamer + `axinferencenet` plugin (x86_64 host, marketing figure) | ~750 | ~1.3 ms | VAAPI dmabuf in, SDK plugin out |
-| `axrunmodel` Python harness (`dblbuf, odmabuf=1` on this SBC) | **574 host / 543 system** | 1.7 / 7.4 ms | the runtime-pipeline ceiling, measured locally |
-| **This repo — `--py-dispatch --bench 2 --unpaced` (10 streams)** | **~380 aggregate** | 2.6 ms / batch-frame | side-car routes the AIPU call through `axelera.runtime`; 70 % of axrunmodel ceiling |
-| **This repo — single stream, file output, public C API** | **~246** | 3.2 ms / batch-frame | what `yolo_demo_multi` gets without `--py-dispatch` |
-| **This repo — 10 streams × 25 fps target** | **~218 aggregate (~22 per stream)** | 3.6 ms / batch-frame | 89 % of single-stream, all 10 mp4s clean |
-| `axelera.runtime.op.seq()` (Python "Pythonic API") | **~13** | 78 ms | synchronous frame loop in Python; not for throughput |
-
-### Closing the gap to `axrunmodel` with `--py-dispatch`
-
-`tools/aipu_worker.py` is a persistent Python side-car launched by `--py-dispatch`. The orchestrator passes it the input + output dma-buf fds over `SCM_RIGHTS`, then signals one byte per batch to trigger `instance.run`. The runtime's internal pipeline (`prefill=2, drop=2` per axrunmodel) overlaps the next batch's input upload with the current batch's execute, which is what `axr_run_model_instance` *can't* do from C++ alone:
-
-```text
-                      (C++ worker thread)               (Python side-car)
-   preproc → inst_q ──► memcpy into in-dmabuf ──► socket "G" ─────► instance.run([in_fd], [out_fds])
-                                                  socket "D" ◄─────┘  (AIPU writes into out-dmabufs)
-                                                                      (C++ never copies out — heap discard)
-```
-
-Caveats:
-
-- `--py-dispatch` currently requires `--bench 2` (preproc + infer, no postproc/draw/write); the AIPU outputs land in C++-owned dma-bufs but aren't yet ferried back into per-frame heap copies in this mode. The flag is for benchmarking the dispatch ceiling.
-- The C++ skips `axr_device_connect` / `axr_load_model_instance` (Python owns the device) but keeps `axr_load_model` for tensor-info introspection.
-- One persistent Python process per binary, ~80 MB resident.
-
-To reproduce:
-
-```sh
-source ~/axelera_pip/axelera-env/bin/activate
-cd ~/cpp_test
-./run.sh ./yolo_demo_multi -m /path/to/model.json \
-    -i traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4,traffic.mp4 \
-    -o /tmp/probe --unpaced --bench 2 --display 0 \
-    --py-dispatch --py-worker /home/antelao/cpp_test/aipu_worker.py
-```
-
-### Why the public C API alone caps at ~246 fps
-
-Two reasons, both about *concurrency on a single model instance*:
-
-1. **`libruntime2_core.so` exports zero dynamic symbols.** It is consumed only by a bundled Python extension (`_core.cpython-310-aarch64-linux-gnu.so`). The optimized C++ operator pipeline **and** the prefill / async dispatcher live behind that private interface and aren't reachable from a C++ program that links against the public `libaxruntime.so` alone.
-2. **The public C `axr_run_model_instance` is strictly synchronous.** With a batch=4 model, only **one** instance can exist (the model claims all 4 AIPU sub-devices per call), so we can't fan out across multiple workers either. One inference at a time per worker thread ⇒ at most ~310 fps single-thread, and ~246 fps once we add postproc + draw + h264 mux.
-
-`axrunmodel` calls into `libruntime2_core` through its private interface, keeps multiple inferences "prefilled" (its log even says `prefill=2, drop=2`), and amortises per-call setup time across them. That trick is not available through the public C API.
-
-### Why GStreamer + `axinferencenet` is faster again (~750 vs ~446)
-
-`axinferencenet` is a GStreamer plugin from the full SDK. It does:
-
-- VAAPI/iGPU H.264 decode → letterbox → colour convert → quantise, all as **dmabuf** with **no host memcpy** anywhere on the input path.
-- Same private prefill through `libruntime2_core`, plus its own buffer pool that keeps the AIPU's I/O queues saturated.
-- Postproc (DFL + NMS) on the host using its own worker pool.
-
-The result is a near-zero host CPU role on the critical path. The remaining 870 → 750 gap is postproc + sink overhead.
-
-### Why `axinferencenet` is not in our build (and won't be on this image)
-
-The plugin is shipped only as part of the full Voyager SDK install (the `install.sh` Ubuntu path) and the `axelera-voyager-sdk-base` apt package. On a Voyager Linux 1.3.1 SBC:
-
-- `apt`/`dpkg` exist, but `/etc/apt/sources.list.d/` is empty (no Axelera apt source configured) and there's no `sudo` to add one.
-- The pip `axelera-rt` package contains only the runtime libraries, not the GStreamer plugin.
-- The pip `axelera-devkit` package (which would pull in everything) **fails to install** on this image: its transitive dependency `onnxoptimizer` has no aarch64 wheel and Voyager Linux ships no C++ host compiler to build it from source.
-- The Voyager Linux image was built for runtime, not development (no `dev-pkgs`, no `tools-sdk`).
-
-So on this image, **`~246 fps` is the practical ceiling reachable through the public C API**. The `--py-dispatch` mode lifts that to ~380 fps by routing the dispatch through `axelera.runtime` (still within this binary, via the Python side-car). Reaching `axinferencenet`'s ~750 fps would still require either the full Voyager SDK install or a development-flavour Yocto image with the dev-kit.
-
-### Why `display=2` costs FPS only when a viewer is connected
-
-| Display | E2E FPS (single stream) | What's happening |
+| Configuration | fps | Notes |
 |---|---|---|
-| 0 (file only) | **246** | inference saturates; ffmpeg `h264_rkmpp` runs on the VPU asynchronously |
-| 1 (local X11) | ~187 | gst-launch + autovideosink back-pressures the writer |
-| 2 (TCP H.264, **viewer connected**) | ~187 | the streamer ffmpeg + TCP write on the consumer thread |
-| 2 (TCP H.264, **no viewer**) | ~246 | the producer pushes into the leaky 1-slot; the consumer blocks harmlessly; the inference path is unaffected |
+| AIPU silicon ceiling (`axrunmodel --explore-latency`) | **870 dev / 543 system** | best config: `dblbuf, odmabuf=1` |
+| **This repo, single stream, full pipeline (`--display 2` no viewer)** | **246** | baseline through the public C API |
+| **This repo, 10 streams × 25 fps (paced)** | **218 agg.** | all 10 mp4s finalised cleanly |
+| **This repo, 4 streams × 80 fps (paced)** | **~305 agg.** | input-paced; src clip is 60 fps native, ffmpeg duplicates |
+| **This repo, `--py-dispatch --bench 2 --unpaced`, 10 streams** | **380 agg.** | side-car recovers the runtime's prefill/async pipeline; 70 % of axrunmodel ceiling |
+| `axelera.runtime.op.seq()` (Python sync API) | 13 | not for throughput |
 
-The 4×4 composite producer adds ~3 ms of CPU per 33 ms tick (< 1 % CPU), so the composite itself is essentially free.
+Single-call latency through `axr_run_model_instance`: **~3.2 ms / batch-frame**.
 
----
+### Why the public C API caps around 246 fps
 
-## Outputs
+1. `libruntime2_core.so` exports zero dynamic symbols — only the bundled Python
+   `_core` extension can reach the prefill / async dispatcher. From C++ via
+   `libaxruntime.so` you can only do one in-flight call at a time.
+2. With batch=4 a single instance already claims all 4 AIPU sub-devices, so
+   fanning out workers doesn't help either.
 
-Each annotated MP4 is encoded by `ffmpeg -c:v h264_rkmpp` (RK3588 VPU, near-zero CPU cost). At 848×480 / 60 fps the bitrate is ~1.7 Mbps. The composite (when display=2 is active) is the same size, also h264_rkmpp.
-
-After a clean Ctrl-C the files have valid `moov` atoms and play immediately in `ffplay`, QuickTime, or VLC.
-
----
-
-## Limitations and notes
-
-- **All input streams must share the same resolution.** The drawer + composite assume a uniform per-stream cell size and a single `pre_ctx`.
-- **The 4-core deploy is batch=4 only.** A `--no-double-buffer` config would give lower latency (~14 ms vs ~50 ms) at the cost of ~15 % throughput. We chose throughput.
-- **Auto-respawning the display child** is a runtime feature only; the SBC app itself does not auto-restart if it crashes for some other reason. Wrap it in a systemd unit if you want a long-running service.
-- **librga 2.1.0** on this image has a known singleton-destroyed bug; we tried using RGA as the resize+letterbox engine but it fails the first `improcess` call. The fallback is CPU-side single-pass scalar resize+pack, which is already memory-bandwidth bound and is fine.
-- **NEON** doesn't help in this pipeline. We tried a two-pass scalar-resize-then-NEON-pack variant; it regresses to ~235 fps because the temp buffer doubles memory bandwidth, which is the real bottleneck. The single-pass scalar code in this binary is at the bw limit.
+`--py-dispatch` works around this by spawning `tools/aipu_worker.py`, handing
+it the input + output dma-buf fds over `SCM_RIGHTS`, and signalling one byte
+per batch. The Python side calls `axelera.runtime.ModelInstance.run`, which
+goes through `_core` and exercises the same prefill path `axrunmodel` does.
 
 ---
 
-## Repo layout
+## Architecture (one-paragraph version)
 
 ```
-.
-├── README.md                        # this file
-├── LICENSE
-├── .gitignore
-├── toolchain-aarch64.cmake          # cross-toolchain file for CMake
-├── src/
-│   ├── CMakeLists.txt
-│   ├── yolo_demo_multi.cpp          # ~960-line orchestrator (argv parsing + thread launch)
-│   │
-│   │   ── pipeline modules ──
-│   ├── concurrency.h                # BoundedQueue + LeakyOne (header-only templates)
-│   ├── subprocess.h / .cpp          # Subprocess type + ffmpeg/gst-launch wiring
-│   ├── dma_heap.h / .cpp            # InputBufferPool + dma-heap ABI + cache sync
-│   ├── drawing.h / .cpp             # BGR draw primitives + class_color
-│   ├── font.h / .cpp                # TTF rasterizer (stb_truetype, Liberation Sans Bold)
-│   ├── yolo_preproc.h / .cpp        # letterbox + quantize into model input layout
-│   ├── yolo_postproc.h / .cpp       # DFL + sigmoid + class-aware NMS
-│   ├── frame.h                      # Frame and Stream structs
-│   ├── py_aipu_client.h / .cpp      # client for the Python AIPU side-car (--py-dispatch)
-│   │
-│   │   ── data ──
-│   ├── coco_names.h                 # 80 COCO class names
-│   ├── coco_palette.h               # curated 80-class colour palette
-│   ├── liberation_sans_bold.h       # TTF baked as a C uint8 array
-│   └── stb/stb_truetype.h           # public-domain TTF rasteriser (single header)
-├── tools/
-│   └── aipu_worker.py               # persistent Python side-car invoked by --py-dispatch
-├── scripts/
-│   ├── 01_update_driver.sh          # on SBC, as root: metis driver 1.4.4 -> 1.4.16
-│   ├── 02_install_runtime.sh        # on SBC: pip-install axelera-rt into a venv
-│   ├── 03_deploy_model.sh           # on build host: compile yolo11n with 4 AIPU cores
-│   ├── 04_build.sh                  # on build host: cross-compile yolo_demo_multi
-│   └── 05_run.sh                    # on SBC: convenience wrapper around the binary
-└── docs/
-    └── images/
-        ├── hud_grid_n1.png               # composite, N=1 (1x1) with overall HUD
-        ├── hud_grid_n4.png               # composite, N=4 (2x2) with overall HUD
-        └── hud_grid_n10.png              # composite, N=10 (4x3) with overall HUD
+decoders → raw_q → preproc threads → inst_q
+                                       │
+                                       ▼
+                worker (batch-4 pack → axr_run_model_instance) → done_q
+                                       │
+                                       ▼
+                drawer (per-stream reorder + postproc + box draw)
+                              │
+                ┌─────────────┴─────────────┐
+                ▼                           ▼
+        per-stream write_q          snapshot[i] mutex
+        (h264_rkmpp mp4)                   │
+                                           ▼
+                              display producer @ 30 Hz → LeakyOne (1-deep)
+                                           ▼
+                              display consumer → waylandsink / ffmpeg TCP MPEG-TS
 ```
 
-### Code organization
+Inference never blocks on the display path (1-deep leaky slot drops frames if
+the consumer is slow). Per-stream MP4 writers run in parallel. The drawer
+keeps a per-stream `pending` map so writers see frames in increasing order
+even if the AIPU batch reorders them.
 
-All non-trivial logic lives in the dedicated modules listed above. The C++
-binary is a single static library (`yolo_voyager_core`) plus a thin executable
-(`yolo_demo_multi`) that ties them together. Each module:
+---
 
-- has a short header with one-line doc comments for every public symbol;
-- exposes its API in the `yvm::` namespace;
-- compiles in isolation against just its declared dependencies.
+## Limitations
 
-If you want to reuse any piece of the pipeline elsewhere (the dma-heap pool, the
-TTF rasterizer, the YOLO decode/NMS, the subprocess wrappers), it's a drop-in
-include + link against the static library.
+- **All input streams must share the same resolution.** Composite + model preproc
+  assume a uniform per-stream cell size.
+- **`--py-dispatch` is `--bench 2` only** on this branch. Outputs land in the
+  side-car's heap and aren't ferried back into per-frame buffers, so no postproc
+  / draw / mp4 write while it's on. Use `--py-dispatch` for the dispatch-ceiling
+  benchmark; use the default path (no `--py-dispatch`) for the demo with boxes.
+- **Source-rate cap on file inputs.** `--fps N` higher than the file's native fps
+  doesn't actually deliver more frames — ffmpeg's `-r N` just re-stamps. Use
+  `--unpaced` (drops `-re`) to decode at host speed for benchmarks.
+- **Batch=4 only.** Switching to batch=1 with `--workers N` would give lower
+  latency (~14 ms vs ~50 ms) at the cost of ~15 % throughput; the current
+  deploy is throughput-tuned.
+- **Fresh `deploy.py` outputs can be rejected by the SBC runtime.** Tonight's
+  diagnosis: voyager-sdk caches per-config compiler venvs under
+  `~/.cache/axelera/venvs/<hash>/` — adding `compilation_config:` to the YAML
+  binds the deploy to whatever compiler version is cached (often older than the
+  active venv's). Even after fixing that, the SBC's `axelera-runtime 1.6.0 +
+  axelera-runtime2 0.1.8` silently rejects ELFs produced by today's SDK 1.6
+  build. Only the pre-existing yolo11n on the SBC currently runs end-to-end;
+  see the [model-zoo branch report](https://github.com/jde-axelera/yocto_voyager/blob/feat/model-zoo/docs/MODEL_ZOO_REPORT.md)
+  for the full investigation.
+- **`librga` + **NEON** dead-ends documented.** The Voyager 1.3.1 librga
+  singleton-destroyed bug makes the RGA resize path unusable; the NEON pack
+  variant doubles memory bandwidth and regresses to ~235 fps. The single-pass
+  scalar code is at the memory-bandwidth limit already.
+- **Auto-respawn covers the display child only** — wrap the whole binary in a
+  systemd unit if you need it to survive its own crash.
+
+---
+
+## TODO
+
+In rough priority order:
+
+1. **Resolve the SDK / runtime ABI gap** so freshly compiled models actually
+   run on the SBC. Two paths: `pip install --upgrade axelera-runtime
+   axelera-runtime2` into the SBC's `~/axelera_pip/axelera-env/` (closest to
+   what fresh SDK builds expect), or roll the build host's compiler back to
+   match what produced `~/yolo11n_4c/` (commit `e98f11f` of voyager-sdk
+   1.6, but with the exact pip wheelset from that day).
+2. **Wipe `~/.cache/axelera/venvs/` before each deploy** (or stop patching
+   the YAML and pass `--aipu-cores` only on the CLI). Avoids the cache-poisoned
+   1.5.3 compiler trap.
+3. **Lift the `--py-dispatch` → `--bench 2` restriction.** Map the C++-owned
+   output dma-bufs into the postproc path so full-pipeline runs can also use
+   the side-car. Already prototyped on the
+   [feat/model-zoo branch](https://github.com/jde-axelera/yocto_voyager/tree/feat/model-zoo).
+4. **Generalise to other task classes.** A `TaskHandler` interface + per-task
+   modules (`tasks/detection.cpp` already in place, `classify`/`pose`/`seg`/
+   `obb`/`face`/`embed` stubs ready) is on `feat/model-zoo`. Merge once #1 is
+   resolved so the model zoo actually runs.
+5. **Ping-pong input dmabufs.** Currently the worker memcpys input N+1 into
+   the dmabuf *after* AIPU run N completes. Two input dmabufs alternating
+   would overlap input prep with AIPU execute — the missing piece between
+   tonight's 380 fps and `axrunmodel`'s 543 fps system.
+6. **Postproc decoders** for the non-detection task modules (currently
+   stubs that exercise preproc + inference only). ~50 lines each from the
+   standard ONNX layouts; gated on #1.
 
 ---
 
