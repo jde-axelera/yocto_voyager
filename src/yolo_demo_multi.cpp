@@ -552,6 +552,34 @@ int main(int argc, char** argv) {
 
     std::atomic<int64_t> infer_ns_total{0};
     std::atomic<int>     frames_inferred{0};
+
+    // ---- pipeline latency instrumentation ----
+    //
+    // We attach a steady_clock timestamp to each Frame in the decoder thread
+    // (Frame::t_arr) and compute two derived latencies later in the pipeline:
+    //
+    //   v4l2->drawn:   from t_arr to drawer finishing postproc + box draw
+    //                  (covers preproc, AIPU dispatch, postproc, box draw)
+    //   v4l2->gst:     from t_arr to the moment the display consumer writes
+    //                  the composite that contains this frame into gst-launch
+    //                  stdin (covers everything above + composite sampling
+    //                  jitter + LeakyOne buffering)
+    //
+    // The display consumer cannot easily look up which Frame is in the latest
+    // composite, so the drawer publishes its most recent stream-0 t_arr into
+    // `latest_drawn_arr_steady_ns` (nanoseconds since steady_clock epoch) and
+    // the consumer reads that to compute the v4l2->gst latency.
+    std::atomic<int64_t> sum_ns_arr_to_drawn{0};
+    std::atomic<int64_t> n_arr_to_drawn{0};
+    std::atomic<int64_t> max_ns_arr_to_drawn{0};
+    std::atomic<int64_t> sum_ns_arr_to_disp{0};
+    std::atomic<int64_t> n_arr_to_disp{0};
+    std::atomic<int64_t> max_ns_arr_to_disp{0};
+    std::atomic<int64_t> latest_drawn_arr_steady_ns{0};
+    auto update_max_atomic = [](std::atomic<int64_t>& m, int64_t v) {
+        int64_t prev = m.load(std::memory_order_relaxed);
+        while (v > prev && !m.compare_exchange_weak(prev, v, std::memory_order_relaxed)) {}
+    };
     auto t0 = clk::now();
 
     // ---- stats logger (every 2 s) + shutdown watcher ----
@@ -578,6 +606,23 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "[stats] infer=%.1f fps  agg-drawn=%.1f fps  per-stream:%s\n",
                          infer_fps, agg, per_stream.c_str());
+
+            // Latency summary (resets accumulators each tick).
+            int64_t n_d = n_arr_to_drawn.exchange(0, std::memory_order_relaxed);
+            int64_t s_d = sum_ns_arr_to_drawn.exchange(0, std::memory_order_relaxed);
+            int64_t m_d = max_ns_arr_to_drawn.exchange(0, std::memory_order_relaxed);
+            int64_t n_p = n_arr_to_disp.exchange(0, std::memory_order_relaxed);
+            int64_t s_p = sum_ns_arr_to_disp.exchange(0, std::memory_order_relaxed);
+            int64_t m_p = max_ns_arr_to_disp.exchange(0, std::memory_order_relaxed);
+            if (n_d > 0) {
+                std::fprintf(stderr,
+                    "[lat ] v4l2->drawn  mean=%.2f ms  max=%.2f ms"
+                    "   v4l2->gst-stdin  mean=%.2f ms  max=%.2f ms"
+                    "  (excludes USB capture + waylandsink/DRM/panel)\n",
+                    s_d / 1e6 / (double)n_d, m_d / 1e6,
+                    n_p > 0 ? s_p / 1e6 / (double)n_p : 0.0,
+                    m_p / 1e6);
+            }
         }
     });
     std::thread sig_watcher([&]() {
@@ -600,6 +645,7 @@ int main(int argc, char** argv) {
                 f->sw = s->sw; f->sh = s->sh;
                 f->stream_id = s->id;
                 if (!yvm::read_full(s->reader.fd, f->bgr.data(), frame_bytes)) break;
+                f->t_arr = std::chrono::steady_clock::now();
                 f->idx = idx++;
                 s->decoded.fetch_add(1, std::memory_order_relaxed);
                 raw_q.push(std::move(f));
@@ -779,6 +825,25 @@ int main(int argc, char** argv) {
                 }
 
                 s->drawn.fetch_add(1, std::memory_order_relaxed);
+
+                // Latency accounting: from V4L2 arrival to here (drawer done).
+                {
+                    auto now = std::chrono::steady_clock::now();
+                    int64_t lat_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         now - cur->t_arr).count();
+                    sum_ns_arr_to_drawn.fetch_add(lat_ns, std::memory_order_relaxed);
+                    n_arr_to_drawn.fetch_add(1, std::memory_order_relaxed);
+                    update_max_atomic(max_ns_arr_to_drawn, lat_ns);
+                    // Publish stream-0's arrival timestamp for the display
+                    // consumer to read when it next writes a composite.
+                    if (cur->stream_id == 0) {
+                        latest_drawn_arr_steady_ns.store(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                cur->t_arr.time_since_epoch()).count(),
+                            std::memory_order_relaxed);
+                    }
+                }
+
                 if (live_display) {
                     std::lock_guard<std::mutex> lk(s->snap_mu);
                     std::memcpy(s->snapshot.data(), cur->bgr.data(),
@@ -976,9 +1041,23 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> frame;
             while (!disp_stop.load(std::memory_order_relaxed) && disp_slot.pop(frame)) {
                 if (disp.fd < 0) open_disp();
+                // Sample latest drawn-frame arrival just before we hand the
+                // composite to gst-launch. This is the "v4l2 -> gst stdin"
+                // latency; it does NOT include GStreamer plugin chain, DRM
+                // commit, or monitor scan-out time (~one frame at panel rate).
+                int64_t arr_ns = latest_drawn_arr_steady_ns.load(std::memory_order_relaxed);
                 if (!yvm::write_full(disp.fd, frame.data(), frame.size())) {
                     std::fprintf(stderr, "[display] viewer disconnected; respawning...\n");
                     yvm::close_sub(disp);
+                } else if (arr_ns > 0) {
+                    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    int64_t lat_ns = now_ns - arr_ns;
+                    if (lat_ns >= 0 && lat_ns < (int64_t)5e9) {  // sanity clamp
+                        sum_ns_arr_to_disp.fetch_add(lat_ns, std::memory_order_relaxed);
+                        n_arr_to_disp.fetch_add(1, std::memory_order_relaxed);
+                        update_max_atomic(max_ns_arr_to_disp, lat_ns);
+                    }
                 }
             }
             yvm::close_sub(disp);

@@ -14,6 +14,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -42,6 +43,12 @@ struct Frame {
     // Letterbox transform from preprocess; needed for post-decode coord undo.
     float lscale = 1.0f;
     int   padx = 0, pady = 0;
+
+    // Wall-clock arrival time (set in the decoder thread right after the raw
+    // bgr24 frame is read from the V4L2/ffmpeg pipe). Used by the latency
+    // instrumentation to compute v4l2-arrival → drawer-done and
+    // v4l2-arrival → gst-stdin-write per-frame timings.
+    std::chrono::steady_clock::time_point t_arr;
 };
 
 using FramePtr = std::unique_ptr<Frame>;
