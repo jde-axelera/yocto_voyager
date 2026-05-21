@@ -48,6 +48,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -580,6 +581,18 @@ int main(int argc, char** argv) {
         int64_t prev = m.load(std::memory_order_relaxed);
         while (v > prev && !m.compare_exchange_weak(prev, v, std::memory_order_relaxed)) {}
     };
+
+    // ---- event-driven display wake-up ----
+    //
+    // The drawer increments `disp_dirty` and signals `disp_cv` after each
+    // fresh snapshot. The display producer waits on the cv instead of polling
+    // at a fixed 30 Hz, cutting up to ~33 ms of pipeline latency in the
+    // single-stream case. A `max_idle` timeout still fires periodically so
+    // the HUD's once-per-second numbers keep refreshing when no streams
+    // produce frames.
+    std::mutex             disp_cv_mu;
+    std::condition_variable disp_cv;
+    std::atomic<int>       disp_dirty{0};
     auto t0 = clk::now();
 
     // ---- stats logger (every 2 s) + shutdown watcher ----
@@ -845,9 +858,17 @@ int main(int argc, char** argv) {
                 }
 
                 if (live_display) {
-                    std::lock_guard<std::mutex> lk(s->snap_mu);
-                    std::memcpy(s->snapshot.data(), cur->bgr.data(),
-                                std::min(s->snapshot.size(), cur->bgr.size()));
+                    {
+                        std::lock_guard<std::mutex> lk(s->snap_mu);
+                        std::memcpy(s->snapshot.data(), cur->bgr.data(),
+                                    std::min(s->snapshot.size(), cur->bgr.size()));
+                    }
+                    // Wake the display producer event-driven (was 30 Hz poll).
+                    {
+                        std::lock_guard<std::mutex> lk(disp_cv_mu);
+                        disp_dirty.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    disp_cv.notify_one();
                 }
                 s->write_q->push(std::move(cur));
             }
@@ -904,8 +925,12 @@ int main(int argc, char** argv) {
         disp_producer = std::thread([&]() {
             std::vector<uint8_t> composite((size_t)comp_w * comp_h * 3, 0);
             using clk2 = std::chrono::steady_clock;
-            const auto period = std::chrono::milliseconds(33);  // ~30 Hz
-            auto next = clk2::now() + period;
+            // Event-driven push, rate-capped to ~60 Hz so multi-stream doesn't
+            // hammer the sink. `max_idle` ensures the HUD keeps refreshing even
+            // if no streams produce frames (e.g., everything stalled).
+            const auto min_gap  = std::chrono::milliseconds(16);
+            const auto max_idle = std::chrono::milliseconds(200);
+            auto last_push = clk2::now();
             std::vector<std::vector<uint8_t>> snaps(streams.size());
             for (auto& sn : snaps) sn.assign((size_t)common_sw * common_sh * 3, 0);
 
@@ -922,8 +947,22 @@ int main(int argc, char** argv) {
                    hud_cpu_pct = 0.0, hud_mem_pct = 0.0;
 
             while (!disp_stop.load(std::memory_order_relaxed)) {
-                std::this_thread::sleep_until(next);
-                next += period;
+                // Wait for the drawer to signal a new snapshot (or timeout for
+                // HUD refresh / stop check). Then enforce the 60 Hz rate cap.
+                {
+                    std::unique_lock<std::mutex> lk(disp_cv_mu);
+                    disp_cv.wait_for(lk, max_idle, [&]{
+                        return disp_dirty.load(std::memory_order_relaxed) != 0
+                            || disp_stop.load(std::memory_order_relaxed);
+                    });
+                    disp_dirty.store(0, std::memory_order_relaxed);
+                }
+                if (disp_stop.load(std::memory_order_relaxed)) break;
+                auto rate_target = last_push + min_gap;
+                if (clk2::now() < rate_target)
+                    std::this_thread::sleep_until(rate_target);
+                last_push = clk2::now();
+
                 for (size_t i = 0; i < streams.size(); ++i) {
                     Stream* s = streams[i].get();
                     {
@@ -1124,6 +1163,7 @@ int main(int argc, char** argv) {
     }
     if (live_display) {
         disp_stop.store(true);
+        disp_cv.notify_all();    // wake the event-driven producer
         disp_slot.close();
         if (disp_producer.joinable()) disp_producer.join();
         if (disp_consumer.joinable()) disp_consumer.join();
