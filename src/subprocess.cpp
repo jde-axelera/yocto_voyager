@@ -139,12 +139,17 @@ Subprocess gst_local_display(int w, int h, double fps, const char* /*title*/,
         const char* sink_name = "waylandsink";
         const char* fs_prop   = fullscreen ? "fullscreen=true" : "fullscreen=false";
         const char* sync_prop = "sync=false";
+        // Voyager 1.3.1's waylandsink (gst-plugins-bad on rockchip) misrenders
+        // 24-bit BGR/RGB buffers — it interprets the bytes in the wrong order
+        // and the red/blue channels come out swapped. Forcing videoconvert to
+        // output an explicit 4-byte BGRA caps avoids the bug entirely.
         const char* argv_gst[] = {
             "gst-launch-1.0", "-q",
             "fdsrc", "fd=0", "!",
             "rawvideoparse", "format=bgr", w_arg, h_arg, r_arg, "!",
             "queue", "max-size-buffers=2", "leaky=downstream", "!",
             "videoconvert", "!",
+            "video/x-raw,format=BGRA", "!",
             sink_name, fs_prop, sync_prop,
             nullptr
         };
