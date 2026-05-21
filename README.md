@@ -153,6 +153,13 @@ visible latency is the gather wait, not the AIPU. A `--aipu-cores=1`
 re-deploy (effective batch=1) removes the gather wait at the cost of the
 device-side throughput ceiling dropping from ~870 fps to ~135 fps.
 
+> **Attempted batch=1 re-deploy:** A fresh `deploy.py --aipu-cores=1` on
+> the build host produces a valid `[1, 642, 656, 4]`-input model.json with
+> `aipu_cores_used: 1`, but the resulting kernel ELF **segfaults the SBC
+> binary at load time** — the SDK/runtime ABI gap (TODO #1) blocks this
+> route. Needs the runtime upgrade on the SBC or the build-host SDK
+> rolled back to the version that produced `~/yolo11n_4c/`.
+
 Not included in those numbers: USB MJPEG capture + ffmpeg decode ahead of
 the pipe (~15-30 ms), GStreamer plugin chain after our write + DRM commit
 + panel scan-out (~30-50 ms). Expect total glass-to-glass of ~150-200 ms
