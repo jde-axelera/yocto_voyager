@@ -129,6 +129,35 @@ it the input + output dma-buf fds over `SCM_RIGHTS`, and signalling one byte
 per batch. The Python side calls `axelera.runtime.ModelInstance.run`, which
 goes through `_core` and exercises the same prefill path `axrunmodel` does.
 
+### Latency (the other axis)
+
+The `[lat]` stats line emitted every 2 s breaks down two in-process segments:
+
+- **v4l2 → drawn** — V4L2/ffmpeg pipe-read to drawer thread finishing
+  postproc + box draw. Covers preproc, batch-gather wait, AIPU dispatch,
+  postproc, box draw.
+- **v4l2 → gst-stdin** — same start point through to bytes being written
+  into the `gst-launch` stdin pipe (display path inside our process).
+
+Measured on `usb:0` single-stream, 30 fps, `--display 1 --fullscreen --boxes-only`:
+
+| Path | v4l2 → drawn | v4l2 → gst-stdin |
+|---|---|---|
+| C API (default) | ~109 ms mean / ~165 ms max | ~110 ms / ~175 ms |
+| `--py-dispatch` | ~98 ms / ~150 ms | ~99 ms / ~161 ms |
+
+The ~95 ms floor is the **batch=4 gather wait** at the worker: at 30 fps a
+batch waits ~3 × 33 ms for siblings 2-4 to arrive before it dispatches.
+`--py-dispatch` shaves ~10 ms via the async prefill path, but most of the
+visible latency is the gather wait, not the AIPU. A `--aipu-cores=1`
+re-deploy (effective batch=1) removes the gather wait at the cost of the
+device-side throughput ceiling dropping from ~870 fps to ~135 fps.
+
+Not included in those numbers: USB MJPEG capture + ffmpeg decode ahead of
+the pipe (~15-30 ms), GStreamer plugin chain after our write + DRM commit
++ panel scan-out (~30-50 ms). Expect total glass-to-glass of ~150-200 ms
+mean at 30 fps single-stream paced input.
+
 ---
 
 ## Architecture (one-paragraph version)
