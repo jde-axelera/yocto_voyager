@@ -48,9 +48,10 @@ sh 01_update_driver.sh                  # reboots; check /sys/class/metis/versio
 # 2. Install axelera-rt venv             (on the SBC, as the default user)
 sh 02_install_runtime.sh                # creates ~/axelera_pip/axelera-env/
 
-# 3. Compile yolo11n for 4 AIPU cores    (on the build host)
-SDK_DIR=~/voyager-sdk-1.6 sh 03_deploy_model.sh
-# → produces yolo11n_4core.tar.gz (~20 MB). scp to SBC, extract to ~/yolo11n_4c/.
+# 3. Compile yolo11n                      (on the build host)
+SDK_DIR=~/voyager-sdk-1.6 sh 03_deploy_model.sh                  # 4-core (throughput)
+SDK_DIR=~/voyager-sdk-1.6 AIPU_CORES=1 sh 03_deploy_model.sh     # 1-core (low latency)
+# → produces yolo11n_<N>core.tar.gz (~20 MB). scp to SBC, extract to ~/yolo11n_<N>c/.
 
 # 4. Cross-compile the binary            (on the build host)
 sh 04_build.sh                          # → build/yolo_demo_multi (aarch64 ELF)
@@ -62,6 +63,15 @@ sh 05_run.sh ./yolo_demo_multi \
     --out     ~/cpp_test/multi_out/single \
     --fps     60 --display 2
 ```
+
+### Throughput vs. latency: pick your deploy
+
+| Deploy | `AIPU_CORES` | Device throughput | In-process `v4l2 → drawn` latency | When |
+|---|---|---|---|---|
+| **4-core (batch=4)** | `4` (default) | ~870 fps device / ~246 fps via C API | ~100 ms mean | many streams, throughput-bound (e.g. 10× 25 fps) |
+| **1-core (batch=1)** | `1` | ~135 fps device / ~90 fps via C API | **~25 ms mean** | single stream, latency-sensitive (camera, live UI) |
+
+The 1-core deploy gives up ~63 % of the 4-core's aggregate throughput but cuts the batch-4 gather-wait floor (~75 ms at 25 fps) entirely — roughly **4× lower** end-to-end latency in display mode. The on-screen HUD shows the live mean as `Lat`.
 
 **USB cameras** — any `--inputs` entry starting with `usb:<N>` opens
 `/dev/video<N>` over V4L2 (MJPEG → BGR24). `--usb-size WxH` sets resolution
@@ -100,6 +110,7 @@ ffplay -probesize 32M -analyzeduration 5M -framedrop tcp://localhost:5050
 | `--boxes-only` | off | draw colour-coded detection boxes on each stream (otherwise streams pass through clean) |
 | `-b, --bench MODE` | `0` | `0`=full pipeline, `1`=skip draw+write, `2`=preproc+infer only |
 | `-w, --workers N` | `1` | inference instances (batch=4 deploy: keep at 1) |
+| `--connect-subdevs N` | auto | force `axr_device_connect` to request N sub-devices. Default `batch*N`. Diagnostic knob for SBC kernel-driver / firmware quirks; leave unset unless `device_connect` is failing. |
 
 ---
 
@@ -112,6 +123,7 @@ ffplay -probesize 32M -analyzeduration 5M -framedrop tcp://localhost:5050
 | **This repo, 10 streams × 25 fps (paced)** | **218 agg.** | all 10 mp4s finalised cleanly |
 | **This repo, 4 streams × 80 fps (paced)** | **~305 agg.** | input-paced; src clip is 60 fps native, ffmpeg duplicates |
 | **This repo, `--py-dispatch --bench 2 --unpaced`, 10 streams** | **380 agg.** | side-car recovers the runtime's prefill/async pipeline; 70 % of axrunmodel ceiling |
+| **This repo, single stream, 1-core deploy, `--bench 2 --unpaced`** | **~90** | batch=1 ELF; trades throughput for the latency win below |
 | `axelera.runtime.op.seq()` (Python sync API) | 13 | not for throughput |
 
 Single-call latency through `axr_run_model_instance`: **~3.2 ms / batch-frame**.
@@ -139,31 +151,31 @@ The `[lat]` stats line emitted every 2 s breaks down two in-process segments:
 - **v4l2 → gst-stdin** — same start point through to bytes being written
   into the `gst-launch` stdin pipe (display path inside our process).
 
+The on-screen HUD also shows the live mean v4l2 → gst-stdin as **`Lat`**
+(refreshed every second), so you can see the latency change in real time
+when toggling deploys.
+
 Measured on `usb:0` single-stream, 30 fps, `--display 1 --fullscreen --boxes-only`:
 
-| Path | v4l2 → drawn | v4l2 → gst-stdin |
+| Deploy / path | v4l2 → drawn | v4l2 → gst-stdin |
 |---|---|---|
-| C API (default) | ~109 ms mean / ~165 ms max | ~110 ms / ~175 ms |
-| `--py-dispatch` | ~98 ms / ~150 ms | ~99 ms / ~161 ms |
+| **4-core**, C API (default) | ~100 ms mean / ~180 ms max | ~110 ms / ~190 ms |
+| **4-core**, `--py-dispatch` | ~98 ms / ~150 ms | ~99 ms / ~161 ms |
+| **1-core**, C API | **~29 ms / ~50 ms** | **~43 ms / ~67 ms** |
 
-The ~95 ms floor is the **batch=4 gather wait** at the worker: at 30 fps a
-batch waits ~3 × 33 ms for siblings 2-4 to arrive before it dispatches.
+The 4-core floor (~95 ms) is the **batch=4 gather wait** at the worker: at
+30 fps a batch waits ~3 × 33 ms for siblings 2-4 before it dispatches.
 `--py-dispatch` shaves ~10 ms via the async prefill path, but most of the
-visible latency is the gather wait, not the AIPU. A `--aipu-cores=1`
-re-deploy (effective batch=1) removes the gather wait at the cost of the
-device-side throughput ceiling dropping from ~870 fps to ~135 fps.
-
-> **Attempted batch=1 re-deploy:** A fresh `deploy.py --aipu-cores=1` on
-> the build host produces a valid `[1, 642, 656, 4]`-input model.json with
-> `aipu_cores_used: 1`, but the resulting kernel ELF **segfaults the SBC
-> binary at load time** — the SDK/runtime ABI gap (TODO #1) blocks this
-> route. Needs the runtime upgrade on the SBC or the build-host SDK
-> rolled back to the version that produced `~/yolo11n_4c/`.
+visible latency is the gather wait, not the AIPU. The **1-core deploy
+removes the gather wait entirely** (batch=1, the dispatch fires per
+frame), trading the device-side throughput ceiling (~870 → ~135 fps) for
+~4× lower latency.
 
 Not included in those numbers: USB MJPEG capture + ffmpeg decode ahead of
 the pipe (~15-30 ms), GStreamer plugin chain after our write + DRM commit
-+ panel scan-out (~30-50 ms). Expect total glass-to-glass of ~150-200 ms
-mean at 30 fps single-stream paced input.
++ panel scan-out (~30-50 ms). Expect total glass-to-glass of **~75-130 ms
+on the 1-core deploy** vs. ~150-200 ms on the 4-core deploy at 30 fps
+single-stream paced input.
 
 ---
 
@@ -198,10 +210,10 @@ even if the AIPU batch reorders them.
 ## Limitations
 
 - All input streams must share resolution.
+- `--py-dispatch` is **broken on the SBC** in Voyager Linux 1.3.1 — `libruntime2_core.so` / `axelera.runtime` is unable to bring up a device context (`zeContextCreateEx` → `NULL_POINTER`) for any sub-device count. Works fine on the x86_64 build host. The C-API path (`libaxruntime.so`) is unaffected; use it by default. Until this is fixed the Python side-car can't be used on the SBC.
 - `--py-dispatch` requires `--workers 1`.
 - `--fps N` is capped by the source file's native fps; use `--unpaced` to decode at host speed.
-- batch=4 only. Going to batch=1 trades ~15 % throughput for ~70 % lower latency.
-- Fresh `deploy.py` outputs may be silently rejected by the SBC runtime (SDK/runtime version skew). The build host's `~/.cache/axelera/venvs/<hash>/` can bind a deploy to an older cached compiler when `compilation_config:` is in the YAML — pass `--aipu-cores` via the CLI and wipe the cache. Even with the right compiler, the SBC's `axelera-runtime 1.6.0 + axelera-runtime2 0.1.8` doesn't accept current SDK 1.6 ELFs. See [`docs/MODEL_ZOO_REPORT.md` on `feat/model-zoo`](https://github.com/jde-axelera/yocto_voyager/blob/feat/model-zoo/docs/MODEL_ZOO_REPORT.md).
+- Pick batch at deploy time, not at runtime — see *Throughput vs. latency* above. Mixing batch sizes in one process is not supported.
 - librga 2.1.0 (Voyager 1.3.1) has a singleton-destroyed bug — RGA resize path unusable.
 - NEON pack variant regresses to ~235 fps (memory-bandwidth bound). Scalar single-pass is already at the bw limit.
 - No process-level auto-restart. Wrap in systemd for long-running.
@@ -212,24 +224,39 @@ even if the AIPU batch reorders them.
 
 In rough priority order:
 
-1. **Resolve the SDK / runtime ABI gap** so freshly compiled models actually
-   run on the SBC. Two paths: `pip install --upgrade axelera-runtime
-   axelera-runtime2` into the SBC's `~/axelera_pip/axelera-env/` (closest to
-   what fresh SDK builds expect), or roll the build host's compiler back to
-   match what produced `~/yolo11n_4c/` (commit `e98f11f` of voyager-sdk
-   1.6, but with the exact pip wheelset from that day).
-2. **Wipe `~/.cache/axelera/venvs/` before each deploy** (or stop patching
-   the YAML and pass `--aipu-cores` only on the CLI). Avoids the cache-poisoned
-   1.5.3 compiler trap.
-3. **Generalise to other task classes.** A `TaskHandler` interface + per-task
+1. **Fix the SBC's Python `axelera.runtime` device-connect path.** On the
+   SBC `ctx.device_connect()` (and therefore `axrunmodel` and
+   `--py-dispatch`) fails for any sub-device count with a
+   `zeContextCreateEx` NULL_POINTER. The C-API path through `libaxruntime.so`
+   works for both 4-core and 1-core deploys, so this is specifically a
+   `libruntime2_core.so` / Python-binding regression — not a kernel-ELF
+   ABI mismatch. Likely needs a `pip install --upgrade axelera-rt
+   axelera-runtime2` into the SBC's `~/axelera_pip/axelera-env/` once a
+   newer wheel ships.
+2. **Generalise to other task classes.** A `TaskHandler` interface + per-task
    modules (`tasks/detection.cpp` already in place, `classify`/`pose`/`seg`/
-   `obb`/`face`/`embed` stubs ready) is on `feat/model-zoo`. Merge once #1 is
-   resolved so the model zoo actually runs.
-4. **Ping-pong input dmabufs.** The worker memcpys input N+1 *after* AIPU run
+   `obb`/`face`/`embed` stubs ready) is on `feat/model-zoo`. Merge so the
+   model zoo actually runs.
+3. **Ping-pong input dmabufs.** The worker memcpys input N+1 *after* AIPU run
    N completes. Two input dmabufs alternating would overlap input prep with
    AIPU execute — the missing piece between 380 fps and `axrunmodel`'s 543 fps.
-5. **Postproc decoders** for the non-detection task modules (currently stubs
-   exercising preproc + inference only). ~50 lines each; gated on #1.
+   (Blocked on #1: needs `--py-dispatch` for the prefill/async path.)
+4. **Postproc decoders** for the non-detection task modules (currently stubs
+   exercising preproc + inference only). ~50 lines each.
+
+### Resolved
+
+- ~~SDK/runtime ABI gap blocks fresh batch=1 deploys.~~ Actually a bug in
+  `03_deploy_model.sh`: an earlier version patched the YAML to inject
+  `compilation_config: { aipu_cores_used: 4 }` under `extra_kwargs`, which
+  conflicts with `--aipu-cores=1` on the CLI and produces a kernel ELF
+  that segfaults even on the build host's own `axrunmodel`. The script
+  now leaves the YAML alone (and refuses to deploy if a stray
+  `compilation_config:` block is present) — pass `AIPU_CORES=1
+  sh 03_deploy_model.sh` for a clean 1-core deploy.
+- ~~Wipe `~/.cache/axelera/venvs/` before each deploy.~~ Was a workaround
+  for the YAML-patch bug above; no longer needed now that the YAML is
+  never modified.
 
 ---
 
