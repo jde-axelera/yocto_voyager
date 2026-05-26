@@ -281,10 +281,12 @@ int main(int argc, char** argv) {
     bool   fullscreen      = false;
     bool   boxes_only      = false;            // default: clean streams + HUD only
     std::string py_worker_path = "tools/aipu_worker.py";
+    int    connect_subdevs = 0;   // 0 = auto (batch*N). Set explicitly to work
+                                  // around SBC drivers that refuse num_sub_devices < 4.
 
     enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE,
            OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER, OPT_FULLSCREEN,
-           OPT_BOXES_ONLY };
+           OPT_BOXES_ONLY, OPT_CONNECT_SUBDEVS };
     static const struct option long_opts[] = {
         {"model",    required_argument, nullptr, 'm'},
         {"inputs",   required_argument, nullptr, 'i'},
@@ -302,6 +304,7 @@ int main(int argc, char** argv) {
         {"display",     required_argument, nullptr, 'd'},
         {"bench",    required_argument, nullptr, 'b'},
         {"workers",  required_argument, nullptr, 'w'},
+        {"connect-subdevs", required_argument, nullptr, OPT_CONNECT_SUBDEVS},
         {"help",     no_argument,       nullptr, 'h'},
         {nullptr,    0,                 nullptr, 0  }
     };
@@ -329,6 +332,7 @@ int main(int argc, char** argv) {
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
+            case OPT_CONNECT_SUBDEVS: connect_subdevs = std::atoi(optarg); break;
             case 'h':         print_usage(argv[0]); return 0;
             default:          print_usage(argv[0]); return 2;
         }
@@ -412,7 +416,8 @@ int main(int argc, char** argv) {
     std::vector<axrModelInstance*> insts(N, nullptr);
     std::string props;
     if (!py_dispatch) {
-        conn = axr_device_connect(ctx, nullptr, batch * N, nullptr);
+        int connect_n = connect_subdevs > 0 ? connect_subdevs : batch * N;
+        conn = axr_device_connect(ctx, nullptr, connect_n, nullptr);
         if (!conn) {
             std::fprintf(stderr, "device_connect: %s\n",
                 axr_last_error_string(AXR_OBJECT(ctx)));
@@ -576,6 +581,9 @@ int main(int argc, char** argv) {
     std::atomic<int64_t> sum_ns_arr_to_disp{0};
     std::atomic<int64_t> n_arr_to_disp{0};
     std::atomic<int64_t> max_ns_arr_to_disp{0};
+    // HUD mirror — reset by the 1-Hz HUD tick, independent of the stats logger.
+    std::atomic<int64_t> hud_sum_ns_arr_to_disp{0};
+    std::atomic<int64_t> hud_n_arr_to_disp{0};
     std::atomic<int64_t> latest_drawn_arr_steady_ns{0};
     auto update_max_atomic = [](std::atomic<int64_t>& m, int64_t v) {
         int64_t prev = m.load(std::memory_order_relaxed);
@@ -944,7 +952,8 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < streams.size(); ++i)
                 hud_last_drawn[i] = streams[i]->drawn.load(std::memory_order_relaxed);
             double hud_e2e_fps = 0.0, hud_inf_fps = 0.0,
-                   hud_cpu_pct = 0.0, hud_mem_pct = 0.0;
+                   hud_cpu_pct = 0.0, hud_mem_pct = 0.0,
+                   hud_lat_ms = 0.0;
 
             while (!disp_stop.load(std::memory_order_relaxed)) {
                 // Wait for the drawer to signal a new snapshot (or timeout for
@@ -1001,6 +1010,9 @@ int main(int argc, char** argv) {
                     hud_e2e_fps = agg;
                     hud_cpu_pct = cpu.sample();
                     hud_mem_pct = mem.sample();
+                    int64_t hn = hud_n_arr_to_disp.exchange(0, std::memory_order_relaxed);
+                    int64_t hs = hud_sum_ns_arr_to_disp.exchange(0, std::memory_order_relaxed);
+                    if (hn > 0) hud_lat_ms = (hs / 1e6) / (double)hn;
                     hud_t_prev  = now;
                 }
 
@@ -1014,17 +1026,19 @@ int main(int argc, char** argv) {
                 //     └──────────────────────────┘
                 FontAtlas* fhud = font24 ? font24 : font18;
                 struct Row { char label[16]; char value[24]; };
-                Row rows[4] = {};
+                Row rows[5] = {};
                 std::snprintf(rows[0].label, sizeof rows[0].label, "E2E");
                 std::snprintf(rows[0].value, sizeof rows[0].value, "%.0f fps", hud_e2e_fps);
                 std::snprintf(rows[1].label, sizeof rows[1].label, "Infer");
                 std::snprintf(rows[1].value, sizeof rows[1].value, "%.0f fps", hud_inf_fps);
-                std::snprintf(rows[2].label, sizeof rows[2].label, "CPU");
-                std::snprintf(rows[2].value, sizeof rows[2].value, "%.0f %%",  hud_cpu_pct);
-                std::snprintf(rows[3].label, sizeof rows[3].label, "MEM");
-                std::snprintf(rows[3].value, sizeof rows[3].value, "%.0f %%",  hud_mem_pct);
+                std::snprintf(rows[2].label, sizeof rows[2].label, "Lat");
+                std::snprintf(rows[2].value, sizeof rows[2].value, "%.0f ms",  hud_lat_ms);
+                std::snprintf(rows[3].label, sizeof rows[3].label, "CPU");
+                std::snprintf(rows[3].value, sizeof rows[3].value, "%.0f %%",  hud_cpu_pct);
+                std::snprintf(rows[4].label, sizeof rows[4].label, "MEM");
+                std::snprintf(rows[4].value, sizeof rows[4].value, "%.0f %%",  hud_mem_pct);
 
-                const int rows_n   = 4;
+                const int rows_n   = 5;
                 const int pad_x    = 18;
                 const int pad_y    = 14;
                 const int gap_lbl  = 28;             // gap between label and value column
@@ -1096,6 +1110,8 @@ int main(int argc, char** argv) {
                         sum_ns_arr_to_disp.fetch_add(lat_ns, std::memory_order_relaxed);
                         n_arr_to_disp.fetch_add(1, std::memory_order_relaxed);
                         update_max_atomic(max_ns_arr_to_disp, lat_ns);
+                        hud_sum_ns_arr_to_disp.fetch_add(lat_ns, std::memory_order_relaxed);
+                        hud_n_arr_to_disp.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             }
