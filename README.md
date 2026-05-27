@@ -57,12 +57,24 @@ SDK_DIR=~/voyager-sdk-1.6 AIPU_CORES=1 sh 03_deploy_model.sh     # 1-core (low l
 sh 04_build.sh                          # → build/yolo_demo_multi (aarch64 ELF)
 
 # 5. Run                                 (on the SBC)
+# --- 4-core deploy: throughput ---
 sh 05_run.sh ./yolo_demo_multi \
     --model   ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
     --inputs  some_video.mp4 \
     --out     ~/cpp_test/multi_out/single \
     --fps     60 --display 2
+
+# --- 1-core deploy: low latency (single stream / live UI) ---
+sh 05_run.sh ./yolo_demo_multi \
+    --model   ~/yolo11n_1c/yolo11n-coco-onnx/yolo11n-coco-onnx/1/model.json \
+    --inputs  some_video.mp4 \
+    --out     ~/cpp_test/multi_out/single \
+    --fps     30 --display 1 --fullscreen --boxes-only
 ```
+
+Only the `--model` path changes between the two deploys; everything else
+in the binary is identical. The model.json's input batch dim drives
+internal sub-device allocation, so the same binary handles both.
 
 ### Throughput vs. latency: pick your deploy
 
@@ -72,6 +84,34 @@ sh 05_run.sh ./yolo_demo_multi \
 | **1-core (batch=1)** | `1` | ~135 fps device / ~90 fps via C API | **~25 ms mean** | single stream, latency-sensitive (camera, live UI) |
 
 The 1-core deploy gives up ~63 % of the 4-core's aggregate throughput but cuts the batch-4 gather-wait floor (~75 ms at 25 fps) entirely — roughly **4× lower** end-to-end latency in display mode. The on-screen HUD shows the live mean as `Lat`.
+
+#### Recipe: low-latency live camera on the SBC
+
+End-to-end run, USB cam → AIPU → fullscreen Wayland window with detection
+boxes and an on-screen `Lat` HUD. Verified on Antelao SoM / Voyager
+Linux 1.3.1 with a stock USB UVC camera at 640×480.
+
+```sh
+# One-time: deploy a 1-core model on the build host, ship to SBC
+SDK_DIR=~/voyager-sdk-1.6 AIPU_CORES=1 sh scripts/03_deploy_model.sh
+scp ~/voyager-sdk-1.6/yolo11n_1core.tar.gz <user>@<sbc>:~/
+ssh <user>@<sbc> 'mkdir -p ~/yolo11n_1c && tar xzf ~/yolo11n_1core.tar.gz -C ~/yolo11n_1c'
+
+# On the SBC (assumes a Wayland session is running and $WAYLAND_DISPLAY is set;
+# over SSH you may need: export XDG_RUNTIME_DIR=/run/user/$(id -u); export WAYLAND_DISPLAY=wayland-0)
+sh scripts/05_run.sh ./yolo_demo_multi \
+    --model    ~/yolo11n_1c/yolo11n-coco-onnx/yolo11n-coco-onnx/1/model.json \
+    --inputs   usb:0 \
+    --usb-size 640x480 \
+    --fps      30 \
+    --out      ~/cpp_test/multi_out/cam \
+    --display  1 --fullscreen --boxes-only \
+    --workers  1
+```
+
+Expected on the HUD after warmup: `E2E 30 fps · Infer 30 fps · Lat ~43 ms ·
+CPU ~##% · MEM ~##%`. Total glass-to-glass with USB capture + gstreamer +
+DRM commit + panel scan-out adds ~30-80 ms on top of `Lat`.
 
 **USB cameras** — any `--inputs` entry starting with `usb:<N>` opens
 `/dev/video<N>` over V4L2 (MJPEG → BGR24). `--usb-size WxH` sets resolution
