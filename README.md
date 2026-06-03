@@ -1,10 +1,11 @@
 # yocto_voyager
 
 End-to-end **YOLOv11n inference pipeline** for the **Axelera Metis AIPU on an
-Antelao SoM (RK3588 + Voyager Linux)**, in C++. Reads 1–10 H.264 streams (or
-USB cameras), runs detection on the AIPU, writes one annotated MP4 per stream,
-and optionally serves a composite display window (local Wayland or TCP MPEG-TS
-H.264 for remote viewing).
+Antelao SoM (RK3588 + Voyager Linux)**, in C++. Reads 1–40 H.264 streams (or
+USB cameras), runs detection on the AIPU, and serves a composite display window
+(local Wayland or TCP MPEG-TS H.264 for remote viewing). Optionally records one
+annotated MP4 per stream (`--record`, off by default). Press **`q`** to quit a
+fullscreen run; a per-component **host-CPU breakdown** prints when the run ends.
 
 | 1 stream (1×1) | 4 streams (2×2) | 10 streams (4×3) |
 |---|---|---|
@@ -21,6 +22,10 @@ top-left of the composite, sampled once a second from `/proc/stat`.
 - `src/` — ~2 500 lines of C++ split into focused modules (preproc, postproc,
   dma-heap pool, drawing, TTF, subprocess wiring, Python AIPU side-car client).
 - `scripts/01..05_*.sh` — five idempotent scripts from "fresh SBC" to "running demo".
+- `scripts/run_*.sh`, `scripts/stop_cam.sh` — ready-to-run SBC demos:
+  `run_cam_lowlat.sh` (single camera, low-latency batch=1, fullscreen),
+  `run_multi_demo.sh N` (1 camera + N-1 traffic streams, N=1..40), and
+  `stop_cam.sh` (graceful stop from a second SSH session).
 - `tools/aipu_worker.py` — Python side-car invoked by `--py-dispatch` (recovers
   the runtime's prefill/async pipeline that the public C API doesn't expose).
 - `src/CMakeLists.txt` + `toolchain-aarch64.cmake` — cross-build from any
@@ -130,14 +135,15 @@ ffplay -probesize 32M -analyzeduration 5M -framedrop tcp://localhost:5050
 ## CLI reference
 
 ```
-./yolo_demo_multi --model PATH --inputs CSV --out PREFIX [options]
+./yolo_demo_multi --model PATH --inputs CSV [--record --out PREFIX] [options]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-m, --model PATH` | *required* | path to `model.json` or `.axm` |
-| `-i, --inputs CSV` | *required* | 1–10 inputs; entry is a file path or `usb:<N>`. All streams must share resolution. |
-| `-o, --out PREFIX` | *required* | output mp4 prefix → `<PREFIX>_0.mp4 … <PREFIX>_N-1.mp4` |
+| `-i, --inputs CSV` | *required* | 1–40 inputs; entry is a file path or `usb:<N>`. All streams must share resolution. |
+| `-o, --out PREFIX` | *required with `--record`* | output mp4 prefix → `<PREFIX>_0.mp4 … <PREFIX>_N-1.mp4`. Ignored unless `--record`. |
+| `--record` | off | write one MP4 per stream. **Off by default** — the h264_rkmpp encoders are a large CPU/disk cost a display/benchmark run doesn't need. |
 | `--conf FLOAT` | `0.25` | detection confidence threshold |
 | `--iou FLOAT` | `0.45` | NMS IoU threshold |
 | `--fps N` | `25` | per-stream target FPS. For files: `ffmpeg -re -r N` pacing. For `usb:<N>`: device capture rate. |
@@ -145,7 +151,7 @@ ffplay -probesize 32M -analyzeduration 5M -framedrop tcp://localhost:5050
 | `--unpaced` | off | drop ffmpeg `-re` (decode at host speed, benchmark mode) |
 | `--py-dispatch` | off | route the AIPU call through `tools/aipu_worker.py` (Python side-car). Works at any `--bench` level; requires `--workers 1`. |
 | `--py-worker PATH` | `tools/aipu_worker.py` | path to the side-car script |
-| `-d, --display MODE` | `0` | `0`=file only, `1`=local Wayland, `2`=TCP MPEG-TS on :5000 |
+| `-d, --display MODE` | `0` | `0`=no display, `1`=local Wayland, `2`=TCP MPEG-TS on :5000. With `1`, press **`q`** on the attached keyboard to quit gracefully (also Ctrl-C / SIGTERM). |
 | `--fullscreen` | off | `--display 1` only: ask waylandsink for a fullscreen window |
 | `--boxes-only` | off | draw colour-coded detection boxes on each stream (otherwise streams pass through clean) |
 | `-b, --bench MODE` | `0` | `0`=full pipeline, `1`=skip draw+write, `2`=preproc+infer only |
@@ -217,6 +223,36 @@ the pipe (~15-30 ms), GStreamer plugin chain after our write + DRM commit
 on the 1-core deploy** vs. ~150-200 ms on the 4-core deploy at 30 fps
 single-stream paced input.
 
+### Where the host CPU goes
+
+Every run prints a per-component host-CPU breakdown when it ends. Each thread
+self-measures via `CLOCK_THREAD_CPUTIME_ID`; the ffmpeg/gst children are sampled
+from `/proc`. **The AIPU's own compute is offloaded to silicon and is not
+counted** — "inference" here is the host cost of feeding/draining the AIPU
+(preproc + dispatch + memcpys + postproc), not the model maths.
+
+Example, 10 streams (1 camera + 9 traffic clips), display on, no recording:
+
+```
+component                       cpu-s   %1core  cores
+decode   (ffmpeg readers)         42.8    305%   3.05   ← software H.264 decode + YUV→BGR
+preprocess                        12.8     92%   0.92
+inference dispatch (worker)        4.4     31%   0.31
+postproc + box draw                5.2     37%   0.37
+composite (grid + HUD)             3.3     23%   0.23
+display feed + gst sink            3.8     27%   0.27
+encode/record (ffmpeg)             0.0      0%   0.00   ← --record adds ~1.7 cores here
+INFERENCE (preproc+dispatch+postproc)  1.60 cores (76%)
+DISPLAY   (composite+feed+sink)        0.51 cores (24%)
+```
+
+Takeaways: at 640×480 the H.264 **codec is cheap; the cost is software
+colorspace conversion** (YUV↔BGR `swscale`) and sheer ffmpeg process count.
+Hardware decode via the RK3588 VPU (`h264_rkmpp`) is actually *slower* at this
+resolution (memory-transfer overhead dominates the trivial decode), and the
+Mali GPU is not a video engine. The cheapest win is simply not recording
+(default) — `--record` adds back the encoder column.
+
 ---
 
 ## Architecture (one-paragraph version)
@@ -283,6 +319,12 @@ In rough priority order:
    (Blocked on #1: needs `--py-dispatch` for the prefill/async path.)
 4. **Postproc decoders** for the non-detection task modules (currently stubs
    exercising preproc + inference only). ~50 lines each.
+5. **Cut the ffmpeg colorspace CPU.** The CPU breakdown shows decode/encode are
+   dominated by software YUV↔BGR `swscale`, not the codec. An NV12-native path
+   (decode→NV12→preproc/draw in NV12→encode) would drop both conversions, but
+   it's a real rewrite (preproc, drawing, display all assume BGR/RGB). RGA could
+   do the conversion in hardware, but Voyager 1.3.1's librga 2.1.0 is buggy and
+   this ffmpeg build has no `scale_rkrga` filter.
 
 ### Resolved
 
