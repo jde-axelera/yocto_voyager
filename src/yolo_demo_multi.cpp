@@ -52,11 +52,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <glob.h>
+#include <linux/input.h>
 #include <linux/types.h>
 #include <map>
 #include <memory>
+#include <poll.h>
 #include <signal.h>
 #include <string>
 #include <sys/ioctl.h>
@@ -96,7 +100,143 @@ namespace {
 
 // Process-wide shutdown flag; flipped by SIGINT/SIGTERM. Threads poll it.
 std::atomic<bool> g_shutdown{false};
-void on_sig(int) { g_shutdown.store(true); }
+// Set only on a *forced* quit (SIGINT/SIGTERM/'q'), never on normal EOF
+// completion. Arms the hard-exit watchdog so a wedged pipeline can't freeze.
+std::atomic<bool> g_force_quit{false};
+void on_sig(int) { g_shutdown.store(true); g_force_quit.store(true); }
+
+// PID of the local gst-launch / TCP-streamer display child, published by the
+// display consumer so sig_watcher can SIGTERM it on shutdown — that unblocks a
+// disp_consumer wedged in write() to a frozen waylandsink (which closing the
+// frame queue cannot interrupt). -1 when no child is running.
+std::atomic<pid_t> g_disp_pid{-1};
+
+// Number of input streams, published after argv parse. The forced-quit watchdog
+// scales its grace period by this — finalizing N MP4 encoders under full CPU
+// load (N up to 40) legitimately takes longer than a couple of seconds.
+std::atomic<int> g_stream_count{0};
+
+// SIGKILL every process whose parent is us. Used by the watchdog as a last
+// resort so a forced _exit() never leaves orphaned ffmpeg/gst children behind.
+// Parses /proc/<pid>/stat; comm (field 2) may contain spaces/parens, so we key
+// off the last ')' and read state + ppid after it.
+void kill_children() {
+    pid_t me = getpid();
+    DIR* d = opendir("/proc");
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        pid_t p = (pid_t)atoi(e->d_name);
+        if (p <= 0 || p == me) continue;
+        char path[64];
+        std::snprintf(path, sizeof path, "/proc/%d/stat", (int)p);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        char buf[512];
+        char* line = fgets(buf, sizeof buf, f);
+        fclose(f);
+        if (!line) continue;
+        char* rp = std::strrchr(line, ')');
+        if (!rp) continue;
+        char state; int ppid = -1;
+        if (sscanf(rp + 1, " %c %d", &state, &ppid) == 2 && ppid == (int)me)
+            ::kill(p, SIGKILL);
+    }
+    closedir(d);
+}
+
+// ---- per-component host-CPU accounting (microseconds) ----
+// Threads add their own CLOCK_THREAD_CPUTIME_ID at exit; the ffmpeg/gst child
+// processes are sampled once at shutdown. The AIPU's own compute is offloaded
+// to silicon and intentionally NOT counted here — these are host CPU costs.
+std::atomic<long long> cpu_decode_us{0};     // ffmpeg readers + decoder threads
+std::atomic<long long> cpu_preproc_us{0};    // preprocess threads (resize/letterbox/quant)
+std::atomic<long long> cpu_infer_us{0};      // worker thread: pack + dispatch + unpack
+std::atomic<long long> cpu_draw_us{0};       // drawer thread: postproc (DFL/NMS) + box draw
+std::atomic<long long> cpu_encode_us{0};     // ffmpeg writers (h264_rkmpp) + writer threads
+std::atomic<long long> cpu_composite_us{0};  // disp_producer: grid assembly + HUD
+std::atomic<long long> cpu_dispout_us{0};    // disp_consumer: feed the display pipe
+std::atomic<long long> cpu_gst_us{0};        // gst-launch child: videoconvert + waylandsink
+
+// CPU time consumed by the calling thread since it started, in microseconds.
+long long thread_cpu_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+// Cumulative (utime+stime) of a live pid from /proc/<pid>/stat, in microseconds.
+// comm (field 2) may contain spaces/parens, so key off the last ')': the tokens
+// after it are state ppid pgrp session tty tpgid flags minflt cminflt majflt
+// cmajflt utime stime ... — so utime/stime are the 12th/13th tokens.
+long long proc_cpu_us(pid_t pid) {
+    if (pid <= 0) return 0;
+    char path[64];
+    std::snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[1024];
+    char* line = fgets(buf, sizeof buf, f);
+    fclose(f);
+    if (!line) return 0;
+    char* rp = std::strrchr(line, ')');
+    if (!rp) return 0;
+    char* save = nullptr;
+    char* tok = strtok_r(rp + 1, " ", &save);   // state
+    long vals[16]; int n = 0;
+    while ((tok = strtok_r(nullptr, " ", &save)) != nullptr && n < 14)
+        vals[n++] = atol(tok);                  // vals[0]=ppid ... vals[10]=utime vals[11]=stime
+    if (n < 12) return 0;
+    long tck = sysconf(_SC_CLK_TCK);
+    if (tck <= 0) tck = 100;
+    return (long long)(vals[10] + vals[11]) * 1000000 / tck;
+}
+
+// 'q'-to-quit watcher for the local fullscreen display. In a fullscreen Wayland
+// session there's no terminal to receive Ctrl-C, and waylandsink ignores key
+// presses, so we read the kernel evdev layer directly: every /dev/input/event*
+// delivers KEY_Q regardless of which surface holds Wayland focus. We open the
+// devices read-only and never EVIOCGRAB them, so Weston still sees every event
+// — we're a passive second reader. On 'q' (key down) we flip g_shutdown, the
+// same flag SIGINT sets, so the existing graceful teardown (MP4 trailer +
+// waylandsink shutdown) runs. Needs read access to /dev/input/* (the `input`
+// group on Voyager); if none are openable the thread just exits quietly and
+// SIGINT/`stop_cam.sh` remain the fallback. Polls on a 200 ms timeout so it
+// also exits promptly when shutdown is triggered by some other path.
+void quit_key_watcher() {
+    glob_t gb{};
+    if (glob("/dev/input/event*", 0, nullptr, &gb) != 0) return;
+    std::vector<struct pollfd> pfds;
+    for (size_t i = 0; i < gb.gl_pathc; ++i) {
+        int fd = open(gb.gl_pathv[i], O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) pfds.push_back({fd, POLLIN, 0});
+    }
+    globfree(&gb);
+    if (pfds.empty()) {
+        std::fprintf(stderr,
+            "[quit] no readable /dev/input/event* — 'q' to quit unavailable "
+            "(use Ctrl-C or stop_cam.sh)\n");
+        return;
+    }
+    while (!g_shutdown.load(std::memory_order_relaxed)) {
+        int n = poll(pfds.data(), pfds.size(), 200);
+        if (n <= 0) continue;
+        for (auto& pf : pfds) {
+            if (!(pf.revents & POLLIN)) continue;
+            struct input_event ev;
+            while (read(pf.fd, &ev, sizeof ev) == (ssize_t)sizeof ev) {
+                if (ev.type == EV_KEY && ev.code == KEY_Q && ev.value == 1) {
+                    std::fprintf(stderr, "\n[quit] 'q' pressed — shutting down...\n");
+                    g_force_quit.store(true, std::memory_order_relaxed);
+                    g_shutdown.store(true, std::memory_order_relaxed);
+                    for (auto& p : pfds) ::close(p.fd);
+                    return;
+                }
+            }
+        }
+    }
+    for (auto& p : pfds) ::close(p.fd);
+}
 
 // Per-worker bookkeeping: a dma-heap input dmabuf (mapped both as a file
 // descriptor and a CPU pointer) plus heap-backed output buffers used by
@@ -203,13 +343,14 @@ void free_worker_bufs(std::vector<WorkerBufs>& wb, size_t in_size) {
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
-        "Usage: %s --model PATH --inputs CSV --out PREFIX [options]\n\n"
+        "Usage: %s --model PATH --inputs CSV [--record --out PREFIX] [options]\n\n"
         "Required:\n"
         "  -m, --model PATH         path to model.json or .axm\n"
-        "  -i, --inputs CSV         1..10 comma-separated inputs. Each entry is one of:\n"
+        "  -i, --inputs CSV         1..40 comma-separated inputs. Each entry is one of:\n"
         "                             <path>            .mp4 / any ffmpeg-readable file\n"
         "                             usb:<N>           /dev/video<N> UVC camera (MJPEG)\n"
-        "  -o, --out PREFIX         output mp4 path prefix (writes <PREFIX>_0.mp4 ...)\n\n"
+        "  -o, --out PREFIX         output mp4 path prefix (writes <PREFIX>_0.mp4 ...).\n"
+        "                           Only used with --record; otherwise optional.\n\n"
         "Tuning:\n"
         "      --conf FLOAT         detection confidence threshold (default 0.25)\n"
         "      --iou FLOAT          NMS IoU threshold (default 0.45)\n"
@@ -231,7 +372,8 @@ void print_usage(const char* prog) {
         "      --preproc N          preprocess thread count (default 4)\n\n"
         "Display / output:\n"
         "  -d, --display MODE       0=file only (default)\n"
-        "                           1=local Wayland composite (waylandsink)\n"
+        "                           1=local Wayland composite (waylandsink). Press 'q'\n"
+        "                             on the attached keyboard to quit gracefully.\n"
         "                           2=TCP MPEG-TS H.264 composite on port 5000\n"
         "      --fullscreen         when --display 1, request a fullscreen window\n"
         "                           (waylandsink fullscreen=true). Otherwise the window\n"
@@ -239,7 +381,10 @@ void print_usage(const char* prog) {
         "                           and the user can drag-resize it freely.\n"
         "      --boxes-only         draw per-stream colour-coded detection boxes on top\n"
         "                           of each frame. Default is clean stream pass-through\n"
-        "                           with only the overall HUD on the composite.\n\n"
+        "                           with only the overall HUD on the composite.\n"
+        "      --record             write one MP4 per stream (needs --out). OFF by default:\n"
+        "                           the h264_rkmpp encoders are a large CPU/disk cost that a\n"
+        "                           live display or benchmark run doesn't need.\n\n"
         "Diagnostic / advanced:\n"
         "  -b, --bench MODE         0=full pipeline (default)\n"
         "                           1=skip draw + write (postproc kept)\n"
@@ -265,6 +410,31 @@ int main(int argc, char** argv) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
+    // Hard-exit backstop. On a forced quit (SIGINT/SIGTERM/'q') the normal join
+    // sequence drains the pipeline, but a live USB source has no EOF and an
+    // occasionally-stalled encoder can back-pressure the joins. If we can't
+    // exit within a few seconds, force it: _exit() closes our fds, which gives
+    // the ffmpeg/gst children EOF on stdin so they still finalize the MP4
+    // trailer and close the display window. Only ever armed on a forced quit,
+    // so the normal EOF-completion path (which can legitimately take a moment
+    // to finalize a large MP4) is never cut short.
+    std::thread([]{
+        while (!g_force_quit.load(std::memory_order_relaxed))
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Scale the grace with the stream count: each stream is one more ffmpeg
+        // encoder that must finalize its MP4 trailer, and at N=40 they contend
+        // for the same 8 cores. This never slows the common case — on a clean
+        // shutdown main exits (and the process dies) well before the grace ends.
+        int n = g_stream_count.load(std::memory_order_relaxed);
+        int grace_ms = 3000 + 300 * n;          // N=1 -> 3.3s, N=10 -> 6s, N=40 -> 15s
+        if (grace_ms > 15000) grace_ms = 15000;
+        std::this_thread::sleep_for(std::chrono::milliseconds(grace_ms));
+        std::fprintf(stderr, "\n[quit] graceful drain timed out — forcing exit\n");
+        std::fflush(stderr);
+        kill_children();                          // no orphaned ffmpeg/gst
+        _exit(0);
+    }).detach();
+
     // ---- parse argv with getopt_long ----
     std::string model_path, in_arg, out_prefix;
     float  conf_thresh     = 0.25f;
@@ -280,13 +450,14 @@ int main(int argc, char** argv) {
     bool   py_dispatch     = false;
     bool   fullscreen      = false;
     bool   boxes_only      = false;            // default: clean streams + HUD only
+    bool   record          = false;            // default: do NOT write MP4s (opt in with --record)
     std::string py_worker_path = "tools/aipu_worker.py";
     int    connect_subdevs = 0;   // 0 = auto (batch*N). Set explicitly to work
                                   // around SBC drivers that refuse num_sub_devices < 4.
 
     enum { OPT_CONF = 1000, OPT_IOU, OPT_FPS, OPT_PREPROC, OPT_USB_SIZE,
            OPT_UNPACED, OPT_PY_DISPATCH, OPT_PY_WORKER, OPT_FULLSCREEN,
-           OPT_BOXES_ONLY, OPT_CONNECT_SUBDEVS };
+           OPT_BOXES_ONLY, OPT_CONNECT_SUBDEVS, OPT_RECORD };
     static const struct option long_opts[] = {
         {"model",    required_argument, nullptr, 'm'},
         {"inputs",   required_argument, nullptr, 'i'},
@@ -301,6 +472,7 @@ int main(int argc, char** argv) {
         {"py-worker",   required_argument, nullptr, OPT_PY_WORKER},
         {"fullscreen",  no_argument,       nullptr, OPT_FULLSCREEN},
         {"boxes-only",  no_argument,       nullptr, OPT_BOXES_ONLY},
+        {"record",      no_argument,       nullptr, OPT_RECORD},
         {"display",     required_argument, nullptr, 'd'},
         {"bench",    required_argument, nullptr, 'b'},
         {"workers",  required_argument, nullptr, 'w'},
@@ -329,6 +501,7 @@ int main(int argc, char** argv) {
             case OPT_PY_WORKER:  py_worker_path = optarg;               break;
             case OPT_FULLSCREEN: fullscreen     = true;                 break;
             case OPT_BOXES_ONLY:  boxes_only    = true;                 break;
+            case OPT_RECORD:      record        = true;                 break;
             case 'd':         live_display    = std::atoi(optarg);     break;
             case 'b':         bench           = std::atoi(optarg);     break;
             case 'w':         N               = std::atoi(optarg);     break;
@@ -342,8 +515,13 @@ int main(int argc, char** argv) {
         print_usage(argv[0]);
         return 2;
     }
-    if (model_path.empty() || in_arg.empty() || out_prefix.empty()) {
-        std::fprintf(stderr, "ERROR: --model, --inputs, --out are all required\n\n");
+    if (model_path.empty() || in_arg.empty()) {
+        std::fprintf(stderr, "ERROR: --model and --inputs are required\n\n");
+        print_usage(argv[0]);
+        return 2;
+    }
+    if (record && out_prefix.empty()) {
+        std::fprintf(stderr, "ERROR: --record requires --out PREFIX\n\n");
         print_usage(argv[0]);
         return 2;
     }
@@ -386,10 +564,11 @@ int main(int argc, char** argv) {
             }
         }
     }
-    if (streams.empty() || streams.size() > 10) {
-        std::fprintf(stderr, "ERROR: need 1..10 input videos (got %zu)\n", streams.size());
+    if (streams.empty() || streams.size() > 40) {
+        std::fprintf(stderr, "ERROR: need 1..40 input videos (got %zu)\n", streams.size());
         return 1;
     }
+    g_stream_count.store((int)streams.size(), std::memory_order_relaxed);
 
     // ---- axruntime: 1 context/model/connection/instance (single worker; batch=4 model) ----
     axrContext* ctx = axr_create_context();
@@ -483,7 +662,10 @@ int main(int argc, char** argv) {
                 s->id, s->sw, s->sh, common_sw, common_sh);
             return 1;
         }
-        s->writer = yvm::ffmpeg_writer(s->out_path, s->sw, s->sh, common_fps);
+        // Recording is opt-in (--record). When off we skip the h264_rkmpp
+        // encoder entirely — it's a big CPU cost (BGR→NV12 conversion) and disk
+        // churn that a live display/benchmark run doesn't need.
+        if (record) s->writer = yvm::ffmpeg_writer(s->out_path, s->sw, s->sh, common_fps);
         s->snapshot.assign((size_t)s->sw * s->sh * 3, 0);
         s->write_q = new BoundedQueue<FramePtr>(8);
     }
@@ -649,8 +831,42 @@ int main(int argc, char** argv) {
     std::thread sig_watcher([&]() {
         while (!g_shutdown.load(std::memory_order_relaxed))
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // Sample child-process CPU for the end-of-run breakdown while they are
+        // still alive (the reaping path uses plain waitpid, no rusage). Do this
+        // before any SIGTERM below.
+        for (auto& sp : streams) {
+            cpu_decode_us.fetch_add(proc_cpu_us(sp->reader.pid));
+            cpu_encode_us.fetch_add(proc_cpu_us(sp->writer.pid));
+        }
+        { long long c = proc_cpu_us(g_disp_pid.load(std::memory_order_relaxed));
+          if (c > 0) cpu_gst_us.store(c); }
+        // A live USB source never hits EOF, so wake the v4l2 readers to unblock
+        // the decoders' read_full().
         for (auto& sp : streams)
             if (sp->reader.pid > 0) ::kill(sp->reader.pid, SIGTERM);
+        // Drop in-flight work: closing every queue wakes any thread blocked in
+        // push()/pop() so the join sequence can't wedge on a full downstream
+        // queue (e.g. a momentarily-stalled writer back-pressuring the drawer →
+        // workers → preprocs). close() is idempotent, so this is harmless on the
+        // normal EOF path where these are already closed/drained.
+        raw_q.close();
+        for (auto& q : inst_q) q->close();
+        done_q.close();
+        for (auto& sp : streams)
+            if (sp->write_q) sp->write_q->close();
+        // On a *forced* quit, closing the queues can't interrupt a thread
+        // already blocked in a write() to a child's pipe (a stalled h264_rkmpp
+        // encoder, or a frozen waylandsink). SIGTERM the children: ffmpeg
+        // finalizes its MP4 trailer cleanly on SIGTERM, and either way the pipe
+        // breaks so the writer / display threads get EPIPE and the joins
+        // complete promptly. The normal EOF path finalizes via stdin-close
+        // instead (all frames flushed), so it's left untouched here.
+        if (g_force_quit.load(std::memory_order_relaxed)) {
+            for (auto& sp : streams)
+                if (sp->writer.pid > 0) ::kill(sp->writer.pid, SIGTERM);
+            pid_t dp = g_disp_pid.load(std::memory_order_relaxed);
+            if (dp > 0) ::kill(dp, SIGTERM);
+        }
     });
 
     // ---- decoder threads (one per stream) ----
@@ -671,6 +887,7 @@ int main(int argc, char** argv) {
                 s->decoded.fetch_add(1, std::memory_order_relaxed);
                 raw_q.push(std::move(f));
             }
+            cpu_decode_us.fetch_add(thread_cpu_us());
         });
     }
 
@@ -700,6 +917,7 @@ int main(int argc, char** argv) {
             if (preproc_done.fetch_add(1) + 1 == preproc_threads) {
                 for (auto& q : inst_q) q->close();
             }
+            cpu_preproc_us.fetch_add(thread_cpu_us());
         });
     }
 
@@ -799,6 +1017,7 @@ int main(int argc, char** argv) {
                 if ((int)batch_frames.size() == B) run_batch();
             }
             run_batch();  // flush any partial-batch leftover at EOF
+            cpu_infer_us.fetch_add(thread_cpu_us());
         });
     }
 
@@ -878,23 +1097,28 @@ int main(int argc, char** argv) {
                     }
                     disp_cv.notify_one();
                 }
-                s->write_q->push(std::move(cur));
+                if (record) s->write_q->push(std::move(cur));
+                // else: cur is dropped here (no MP4 writer to consume it).
             }
         }
         for (auto& sp : streams) sp->write_q->close();
+        cpu_draw_us.fetch_add(thread_cpu_us());
     });
 
-    // ---- per-stream writer threads ----
-    for (auto& sp : streams) {
-        Stream* s = sp.get();
-        s->writer_thread = std::thread([&, s]() {
-            FramePtr f;
-            while (s->write_q->pop(f)) {
-                if (bench != 0) continue;
-                if (!yvm::write_full(s->writer.fd, f->bgr.data(), f->bgr.size())) break;
-                s->written.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
+    // ---- per-stream writer threads (only when --record) ----
+    if (record) {
+        for (auto& sp : streams) {
+            Stream* s = sp.get();
+            s->writer_thread = std::thread([&, s]() {
+                FramePtr f;
+                while (s->write_q->pop(f)) {
+                    if (bench != 0) continue;
+                    if (!yvm::write_full(s->writer.fd, f->bgr.data(), f->bgr.size())) break;
+                    s->written.fetch_add(1, std::memory_order_relaxed);
+                }
+                cpu_encode_us.fetch_add(thread_cpu_us());
+            });
+        }
     }
 
     // ---- composite display: producer @ 30 Hz, consumer with auto-respawn ----
@@ -916,8 +1140,12 @@ int main(int argc, char** argv) {
     // Each cell is the source frame downscaled by integer factors (scale_x=cols, scale_y=rows),
     // so for N=1 the cell IS the source frame and no resize happens.
     LeakyOne<std::vector<uint8_t>> disp_slot;
-    std::thread disp_producer, disp_consumer;
+    std::thread disp_producer, disp_consumer, quit_watcher;
     std::atomic<bool> disp_stop{false};
+
+    // Local fullscreen has no terminal for Ctrl-C, so watch evdev for 'q'.
+    if (live_display == 1)
+        quit_watcher = std::thread(quit_key_watcher);
     const int N_streams = (int)streams.size();
     const int GRID_COLS = (int)std::ceil(std::sqrt((double)N_streams));
     const int GRID_ROWS = (int)std::ceil((double)N_streams / GRID_COLS);
@@ -1075,6 +1303,7 @@ int main(int argc, char** argv) {
 
                 disp_slot.push(std::vector<uint8_t>(composite));
             }
+            cpu_composite_us.fetch_add(thread_cpu_us());
         });
 
         disp_consumer = std::thread([&]() {
@@ -1085,6 +1314,7 @@ int main(int argc, char** argv) {
                                                   "yolo11n multi", fullscreen);
                 else
                     disp = yvm::ffmpeg_tcp_streamer(comp_w, comp_h, 30.0, 5000);
+                g_disp_pid.store(disp.pid, std::memory_order_relaxed);
                 std::fprintf(stderr,
                     "[display] composite pid=%d  %dx%d  %dx%d grid  cell %dx%d  (scale 1/%dx1/%d)\n",
                     (int)disp.pid, comp_w, comp_h, GRID_COLS, GRID_ROWS,
@@ -1093,6 +1323,9 @@ int main(int argc, char** argv) {
             open_disp();
             std::vector<uint8_t> frame;
             while (!disp_stop.load(std::memory_order_relaxed) && disp_slot.pop(frame)) {
+                // On shutdown stop feeding the sink and don't respawn it — let
+                // sig_watcher's SIGTERM (or close_sub below) tear the child down.
+                if (g_shutdown.load(std::memory_order_relaxed)) break;
                 if (disp.fd < 0) open_disp();
                 // Sample latest drawn-frame arrival just before we hand the
                 // composite to gst-launch. This is the "v4l2 -> gst stdin"
@@ -1115,6 +1348,11 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // Sample the gst child's CPU while it's (usually) still alive, then
+            // tear it down. sig_watcher may already have sampled+killed it on a
+            // forced quit, so only record a non-zero reading (don't overwrite).
+            { long long c = proc_cpu_us(disp.pid); if (c > 0) cpu_gst_us.store(c); }
+            cpu_dispout_us.fetch_add(thread_cpu_us());
             yvm::close_sub(disp);
         });
     }
@@ -1126,7 +1364,7 @@ int main(int argc, char** argv) {
     for (auto& t : workers)  t.join();
     done_q.close();
     drawer.join();
-    for (auto& sp : streams) sp->writer_thread.join();
+    for (auto& sp : streams) if (sp->writer_thread.joinable()) sp->writer_thread.join();
     g_shutdown.store(true);
     if (stats_t.joinable())     stats_t.join();
     if (sig_watcher.joinable()) sig_watcher.join();
@@ -1184,6 +1422,61 @@ int main(int argc, char** argv) {
         if (disp_producer.joinable()) disp_producer.join();
         if (disp_consumer.joinable()) disp_consumer.join();
     }
+    // g_shutdown is already set above, so the evdev watcher exits its next poll.
+    if (quit_watcher.joinable()) quit_watcher.join();
+
+    // ---- per-component host-CPU breakdown ----
+    // Printed here, after every worker/display thread has joined, so each has
+    // recorded its CLOCK_THREAD_CPUTIME_ID. cpu-seconds are host CPU only; the
+    // AIPU's own matmul/conv work runs on silicon and is NOT counted, so
+    // "inference" is the host cost of feeding/draining the AIPU (preproc +
+    // dispatch + memcpys + postproc), not the model maths itself.
+    {
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
+        double W = total_s > 1e-6 ? total_s : 1e-6;
+        double dec_s = cpu_decode_us.load()    / 1e6;
+        double pre_s = cpu_preproc_us.load()   / 1e6;
+        double inf_s = cpu_infer_us.load()     / 1e6;
+        double drw_s = cpu_draw_us.load()      / 1e6;
+        double enc_s = cpu_encode_us.load()    / 1e6;
+        double cmp_s = cpu_composite_us.load() / 1e6;
+        double out_s = cpu_dispout_us.load()   / 1e6;
+        double gst_s = cpu_gst_us.load()       / 1e6;
+        double infer_side   = pre_s + inf_s + drw_s;     // host side of the model pipeline
+        double display_side = cmp_s + out_s + gst_s;     // compositing + sink
+        std::fprintf(stderr,
+            "\n=== host CPU breakdown over %.1f s wall, %ld cores (AIPU compute offloaded, not counted) ===\n"
+            "  component                       cpu-s   %%1core  cores\n"
+            "  decode   (ffmpeg readers)      %7.1f  %5.0f%%  %5.2f\n"
+            "  preprocess                     %7.1f  %5.0f%%  %5.2f\n"
+            "  inference dispatch (worker)    %7.1f  %5.0f%%  %5.2f\n"
+            "  postproc + box draw            %7.1f  %5.0f%%  %5.2f\n"
+            "  composite (grid + HUD)         %7.1f  %5.0f%%  %5.2f\n"
+            "  display feed (disp consumer)   %7.1f  %5.0f%%  %5.2f\n"
+            "  display sink (gst convert)     %7.1f  %5.0f%%  %5.2f\n"
+            "  encode/record (ffmpeg)         %7.1f  %5.0f%%  %5.2f\n"
+            "  -----------------------------------------------------\n"
+            "  INFERENCE (preproc+dispatch+postproc)  %7.1f cpu-s  %5.2f cores  (%.0f%% of infer+display)\n"
+            "  DISPLAY   (composite+feed+sink)        %7.1f cpu-s  %5.2f cores  (%.0f%% of infer+display)\n"
+            "  decode %.1f cpu-s,  encode/record %.1f cpu-s  (input/output, not infer or display)\n"
+            "  inference : display  =  %.2f : 1\n",
+            total_s, ncpu,
+            dec_s, 100*dec_s/W, dec_s/W,
+            pre_s, 100*pre_s/W, pre_s/W,
+            inf_s, 100*inf_s/W, inf_s/W,
+            drw_s, 100*drw_s/W, drw_s/W,
+            cmp_s, 100*cmp_s/W, cmp_s/W,
+            out_s, 100*out_s/W, out_s/W,
+            gst_s, 100*gst_s/W, gst_s/W,
+            enc_s, 100*enc_s/W, enc_s/W,
+            infer_side, infer_side/W,
+            (infer_side+display_side) > 0 ? 100*infer_side/(infer_side+display_side) : 0.0,
+            display_side, display_side/W,
+            (infer_side+display_side) > 0 ? 100*display_side/(infer_side+display_side) : 0.0,
+            dec_s, enc_s,
+            display_side > 1e-6 ? infer_side/display_side : 0.0);
+    }
+
     free_worker_bufs(wb, in_size);
     for (size_t k = 0; k < sidecar_out_fds.size(); ++k) {
         if (sidecar_out_ptr[k]) munmap(sidecar_out_ptr[k], sidecar_out_alloc[k]);

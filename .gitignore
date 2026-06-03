@@ -9,6 +9,9 @@ wheels/
 *.swp
 .DS_Store
 
+# Claude Code local settings (personal allowlist, not for the team)
+.claude/settings.local.json
+
 # Python
 __pycache__/
 *.pyc
