@@ -992,27 +992,13 @@ int main(int argc, char** argv) {
                     int gx = (int)i % GRID_COLS, gy = (int)i / GRID_COLS;
                     if (gy >= GRID_ROWS) continue;
                     int dst_x0 = gx * cell_w, dst_y0 = gy * cell_h;
-                    // Box-average compositing: average scale_x*scale_y source
-                    // pixels per destination pixel so that thin lines (boxes)
-                    // remain visible and the image looks smoother at small cells.
-                    const int n_px = scale_x * scale_y;
-                    const uint8_t* base = snaps[i].data();
                     for (int y = 0; y < cell_h; ++y) {
+                        const uint8_t* src = snaps[i].data() + (size_t)(y * scale_y) * s->sw * 3;
                         uint8_t* dst = composite.data()
                                      + ((size_t)(dst_y0 + y) * comp_w + dst_x0) * 3;
                         for (int x = 0; x < cell_w; ++x) {
-                            int sum0 = 0, sum1 = 0, sum2 = 0;
-                            for (int sy = 0; sy < scale_y; ++sy) {
-                                const uint8_t* p = base
-                                    + (size_t)(y * scale_y + sy) * s->sw * 3
-                                    + (size_t)(x * scale_x) * 3;
-                                for (int sx = 0; sx < scale_x; ++sx, p += 3) {
-                                    sum0 += p[0]; sum1 += p[1]; sum2 += p[2];
-                                }
-                            }
-                            dst[0] = (uint8_t)(sum0 / n_px);
-                            dst[1] = (uint8_t)(sum1 / n_px);
-                            dst[2] = (uint8_t)(sum2 / n_px);
+                            const uint8_t* p = src + (x * scale_x) * 3;
+                            dst[0] = p[0]; dst[1] = p[1]; dst[2] = p[2];
                             dst += 3;
                         }
                     }
