@@ -39,4 +39,8 @@ if [ ! -d "$SP/axelera/lib" ]; then
 fi
 export LD_LIBRARY_PATH="$SP/axelera/lib:$SP/axelera/runtime2:$SP/axelera_runtime.libs:$SP/axelera_runtime2.libs:${LD_LIBRARY_PATH:-}"
 
+# Activate the venv so that --py-dispatch can import axelera Python modules.
+# shellcheck source=/dev/null
+. "${HOME}/axelera_pip/axelera-env/bin/activate"
+
 exec "$@"
