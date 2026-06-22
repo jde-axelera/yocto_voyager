@@ -126,11 +126,11 @@ The SBC ships with several ready-to-run wrappers in `~/` that handle Wayland env
 
 | Script | What it runs | Notes |
 |---|---|---|
-| `~/run_multi_demo.sh [N]` | N streams: 1 USB camera + N-1 traffic clips, 4-core model | `N` 1–40, default 10 |
-| `~/run_demo_coco6.sh` | 12 video streams (5 military + 7 traffic @ 960×544), 4-core model | No camera |
-| `~/run_mil_demo.sh` | 1 camera + 5 military clips @ 960×544, military 1-core model | Military model SIGSEGVs — falls back to COCO |
-| `~/run_cam_lowlat.sh` | 1 USB camera, 1-core model (`yolo11n_b1`) for low latency | Blocked by 1-core driver bug |
-| `~/stop_cam.sh` | Gracefully stops any running `yolo_demo_multi` | Run from a second SSH session |
+| `scripts/run_multi_demo.sh [N]` | N streams: 1 USB camera + N-1 traffic clips, 4-core model | `N` 1–40, default 10 |
+| `scripts/run_demo_coco6.sh` | 12 video streams (5 military + 7 traffic @ 960×544), 4-core model | No camera |
+| `scripts/run_mil_demo.sh` | 1 camera + 5 military clips @ 960×544, military 1-core model | Military model SIGSEGVs — falls back to COCO |
+| `scripts/run_cam_lowlat.sh` | 1 USB camera, 1-core model (`yolo11n_b1`) for low latency | Blocked by 1-core driver bug |
+| `scripts/stop_cam.sh` | Gracefully stops any running `yolo_demo_multi` | Run from a second SSH session |
 
 All scripts accept `--windowed` to use a resizable window instead of fullscreen, and `--record` to write MP4 outputs.
 
@@ -210,12 +210,12 @@ Grid auto-sizes: 4 streams → 2×2, 9 → 3×3, 10 → 4×3.
 
 > **1-core (batch=1) is currently broken on this board** (`zeContextCreateEx → ZE_RESULT_ERROR_INVALID_NULL_POINTER` on single sub-device allocation). The convenience script `~/run_cam_lowlat.sh` is ready and will work once the driver is fixed. See [Known issues](#known-issues).
 
-Use the pre-installed wrapper (handles Wayland env, venv, and correct paths):
+Use the convenience script (handles Wayland env, venv, and correct paths):
 
 ```sh
-~/run_cam_lowlat.sh             # fullscreen
-~/run_cam_lowlat.sh --windowed  # resizable window
-~/run_cam_lowlat.sh --record    # write output to ~/cpp_test/multi_out/cam_lowlat_0.mp4
+sh ~/yocto_voyager/scripts/run_cam_lowlat.sh             # fullscreen
+sh ~/yocto_voyager/scripts/run_cam_lowlat.sh --windowed  # resizable window
+sh ~/yocto_voyager/scripts/run_cam_lowlat.sh --record    # write output to ~/cpp_test/multi_out/cam_lowlat_0.mp4
 ```
 
 Or manually (requires Wayland env vars set — see above):
