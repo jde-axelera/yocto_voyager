@@ -134,9 +134,13 @@ def main(socket_path: str) -> int:
         dev = devices[0]
         ctx.configure_device(dev, device_firmware='1')
         ax_conn = ctx.device_connect(dev, batch_size, device_firmware_check=0)
+        # double_buffer=False is intentional: with double_buffer=True the
+        # runtime uses internal ping-pong buffers and never writes to the
+        # caller-provided FDs, so C++ always reads zeros.  double_buffer=False
+        # writes directly to the provided FDs synchronously on every call.
         instance = ax_conn.load_model_instance(
             model,
-            double_buffer=double_buffer,
+            double_buffer=False,
             input_dmabuf=True,
             output_dmabuf=output_dmabuf,
             num_sub_devices=batch_size,
