@@ -51,7 +51,7 @@ grep -E '"aipu_cores_used"' "$BUILD/compile_config.json"
 
 # Tar and announce
 OUT="${SDK_DIR}/yolo11n_${AIPU_CORES}core.tar.gz"
-tar czf "$OUT" -C "${SDK_DIR}/build/yolo11n-coco-onnx" yolo11n-coco-onnx/
+tar czf "$OUT" -C "${SDK_DIR}/build" yolo11n-coco-onnx/
 echo
 echo "Done.  Output: $OUT"
 echo "Copy to the SBC and extract:"
