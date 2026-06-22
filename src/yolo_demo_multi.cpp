@@ -206,7 +206,7 @@ void print_usage(const char* prog) {
         "Usage: %s --model PATH --inputs CSV --out PREFIX [options]\n\n"
         "Required:\n"
         "  -m, --model PATH         path to model.json or .axm\n"
-        "  -i, --inputs CSV         1..10 comma-separated inputs. Each entry is one of:\n"
+        "  -i, --inputs CSV         1..40 comma-separated inputs. Each entry is one of:\n"
         "                             <path>            .mp4 / any ffmpeg-readable file\n"
         "                             usb:<N>           /dev/video<N> UVC camera (MJPEG)\n"
         "  -o, --out PREFIX         output mp4 path prefix (writes <PREFIX>_0.mp4 ...)\n\n"
@@ -386,8 +386,8 @@ int main(int argc, char** argv) {
             }
         }
     }
-    if (streams.empty() || streams.size() > 10) {
-        std::fprintf(stderr, "ERROR: need 1..10 input videos (got %zu)\n", streams.size());
+    if (streams.empty() || streams.size() > 40) {
+        std::fprintf(stderr, "ERROR: need 1..40 input videos (got %zu)\n", streams.size());
         return 1;
     }
 
@@ -806,6 +806,16 @@ int main(int argc, char** argv) {
     std::thread drawer([&]() {
         FramePtr f;
         std::vector<Detection> dets;
+        // Scale box thickness so that at least one pixel of each side survives
+        // the grid downsampling in the compositor (which picks every scale_x-th
+        // pixel). Without this, a 2px box on a 4x3 grid (scale_x=4) loses ~50%
+        // of its border pixels and sides appear broken/missing.
+        const int n_s    = (int)streams.size();
+        const int gcols_s = (int)std::ceil(std::sqrt((double)n_s));
+        const int grows_s = (int)std::ceil((double)n_s / gcols_s);
+        const int box_thick = live_display
+            ? std::max(2, std::max(gcols_s, grows_s))
+            : 2;
         while (done_q.pop(f)) {
             int sid = f->stream_id;
             Stream* s = streams[sid].get();
@@ -840,7 +850,7 @@ int main(int argc, char** argv) {
                             yvm::class_color(d.cls, bc, gc, rc);
                             int x1 = (int)d.x1, y1 = (int)d.y1,
                                 x2 = (int)d.x2, y2 = (int)d.y2;
-                            yvm::draw_rect(im, x1, y1, x2, y2, bc, gc, rc, 2);
+                            yvm::draw_rect(im, x1, y1, x2, y2, bc, gc, rc, box_thick);
                         }
                     }
                 }
@@ -982,13 +992,27 @@ int main(int argc, char** argv) {
                     int gx = (int)i % GRID_COLS, gy = (int)i / GRID_COLS;
                     if (gy >= GRID_ROWS) continue;
                     int dst_x0 = gx * cell_w, dst_y0 = gy * cell_h;
+                    // Box-average compositing: average scale_x*scale_y source
+                    // pixels per destination pixel so that thin lines (boxes)
+                    // remain visible and the image looks smoother at small cells.
+                    const int n_px = scale_x * scale_y;
+                    const uint8_t* base = snaps[i].data();
                     for (int y = 0; y < cell_h; ++y) {
-                        const uint8_t* src = snaps[i].data() + (size_t)(y * scale_y) * s->sw * 3;
                         uint8_t* dst = composite.data()
                                      + ((size_t)(dst_y0 + y) * comp_w + dst_x0) * 3;
                         for (int x = 0; x < cell_w; ++x) {
-                            const uint8_t* p = src + (x * scale_x) * 3;
-                            dst[0] = p[0]; dst[1] = p[1]; dst[2] = p[2];
+                            int sum0 = 0, sum1 = 0, sum2 = 0;
+                            for (int sy = 0; sy < scale_y; ++sy) {
+                                const uint8_t* p = base
+                                    + (size_t)(y * scale_y + sy) * s->sw * 3
+                                    + (size_t)(x * scale_x) * 3;
+                                for (int sx = 0; sx < scale_x; ++sx, p += 3) {
+                                    sum0 += p[0]; sum1 += p[1]; sum2 += p[2];
+                                }
+                            }
+                            dst[0] = (uint8_t)(sum0 / n_px);
+                            dst[1] = (uint8_t)(sum1 / n_px);
+                            dst[2] = (uint8_t)(sum2 / n_px);
                             dst += 3;
                         }
                     }
