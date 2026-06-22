@@ -190,17 +190,22 @@ sh scripts/05_run.sh ./build/yolo_demo_multi \
 
 Grid auto-sizes: 4 streams → 2×2, 9 → 3×3, 10 → 4×3.
 
-#### USB camera (live)
+#### USB camera (live, low-latency)
+
+The 1-core (batch=1) model removes the batch-gather wait and cuts latency from ~100 ms to ~29 ms — use it for live camera. See [Known issues](#known-issues) if the board doesn't support single sub-device allocation yet.
 
 ```sh
 sh scripts/05_run.sh ./build/yolo_demo_multi \
-    --model    ~/yolo11n_4c/yolo11n-coco-onnx/yolo11n-coco-onnx/4/model.json \
+    --model    ~/yolo11n_1c/yolo11n-coco-onnx/yolo11n-coco-onnx/1/model.json \
     --inputs   usb:0 \
     --usb-size 640x480 \
     --fps      30 \
     --out      /tmp/discard \
-    --display  1 --fullscreen --boxes-only
+    --display  1 --fullscreen --boxes-only \
+    --workers  1
 ```
+
+Expected HUD after warmup: `E2E 30 fps · Infer 30 fps · Lat ~43 ms`. Total glass-to-glass (USB capture + GStreamer + DRM) adds ~30–80 ms on top.
 
 ---
 
