@@ -120,7 +120,23 @@ scp build/yolo_demo_multi antelao@<sbc-ip>:~/yocto_voyager/build/
 
 > **Run on the SBC.** A thin wrapper that sets `LD_LIBRARY_PATH` to the axelera-rt venv's `.so` files, then `exec`s whatever you pass. The binary itself handles video decode, AIPU dispatch, drawing, and output.
 
-Before every run, confirm the AIPU is free — it is **single-tenant** (one process at a time):
+#### Pre-installed convenience scripts (already on the SBC)
+
+The SBC ships with several ready-to-run wrappers in `~/` that handle Wayland env vars, venv activation, and absolute paths automatically. Use these unless you need custom flags:
+
+| Script | What it runs | Notes |
+|---|---|---|
+| `~/run_multi_demo.sh [N]` | N streams: 1 USB camera + N-1 traffic clips, 4-core model | `N` 1–40, default 10 |
+| `~/run_demo_coco6.sh` | 12 video streams (5 military + 7 traffic @ 960×544), 4-core model | No camera |
+| `~/run_mil_demo.sh` | 1 camera + 5 military clips @ 960×544, military 1-core model | Military model SIGSEGVs — falls back to COCO |
+| `~/run_cam_lowlat.sh` | 1 USB camera, 1-core model (`yolo11n_b1`) for low latency | Blocked by 1-core driver bug |
+| `~/stop_cam.sh` | Gracefully stops any running `yolo_demo_multi` | Run from a second SSH session |
+
+All scripts accept `--windowed` to use a resizable window instead of fullscreen, and `--record` to write MP4 outputs.
+
+---
+
+Before every manual run, confirm the AIPU is free — it is **single-tenant** (one process at a time):
 
 ```sh
 ps | grep yolo_demo_multi               # must be empty
@@ -190,22 +206,32 @@ sh scripts/05_run.sh ./build/yolo_demo_multi \
 
 Grid auto-sizes: 4 streams → 2×2, 9 → 3×3, 10 → 4×3.
 
-#### USB camera (live, low-latency)
+#### USB camera (live, low latency)
 
-The 1-core (batch=1) model removes the batch-gather wait and cuts latency from ~100 ms to ~29 ms — use it for live camera. See [Known issues](#known-issues) if the board doesn't support single sub-device allocation yet.
+> **1-core (batch=1) is currently broken on this board** (`zeContextCreateEx → ZE_RESULT_ERROR_INVALID_NULL_POINTER` on single sub-device allocation). The convenience script `~/run_cam_lowlat.sh` is ready and will work once the driver is fixed. See [Known issues](#known-issues).
+
+Use the pre-installed wrapper (handles Wayland env, venv, and correct paths):
+
+```sh
+~/run_cam_lowlat.sh             # fullscreen
+~/run_cam_lowlat.sh --windowed  # resizable window
+~/run_cam_lowlat.sh --record    # write output to ~/cpp_test/multi_out/cam_lowlat_0.mp4
+```
+
+Or manually (requires Wayland env vars set — see above):
 
 ```sh
 sh scripts/05_run.sh ./build/yolo_demo_multi \
-    --model    ~/yolo11n_1c/yolo11n-coco-onnx/yolo11n-coco-onnx/1/model.json \
+    --model    ~/yolo11n_b1/yolo11n-coco-onnx/1/model.json \
     --inputs   usb:0 \
     --usb-size 640x480 \
     --fps      30 \
     --out      /tmp/discard \
     --display  1 --fullscreen --boxes-only \
-    --workers  1
+    --workers  1 --bench 0
 ```
 
-Expected HUD after warmup: `E2E 30 fps · Infer 30 fps · Lat ~43 ms`. Total glass-to-glass (USB capture + GStreamer + DRM) adds ~30–80 ms on top.
+Note: `~/yolo11n_b1/` uses single-nested paths (`yolo11n-coco-onnx/1/`) — different from the 4-core tarball which double-nests (`yolo11n-coco-onnx/yolo11n-coco-onnx/4/`).
 
 ---
 
